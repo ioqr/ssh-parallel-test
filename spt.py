@@ -97,6 +97,7 @@ class Config:
     run_command: str
     duration_regex: str | None
     seed_setup: str | None
+    seed_auto: bool
     docker_install: str | None
     clean_command: str | None
     timings_file: Path
@@ -185,10 +186,14 @@ def load_config(path: str) -> Config:
     if timings_file_str:
         timings_file = conf_dir / timings_file_str
     else:
+        # Derive slug from the resolved (symlink-followed) config file path,
+        # so each cluster config gets its own timings even when accessed via
+        # a config.yml symlink.
+        resolved = conf_path.resolve()
         try:
-            rel = str(Path.cwd().relative_to(Path.home()))
+            rel = str(resolved.relative_to(Path.home()))
         except ValueError:
-            rel = str(Path.cwd())
+            rel = str(resolved)
         slug = "-" + re.sub(r'[^a-zA-Z0-9-]', '-', rel)
         timings_file = Path.home() / ".ssh-parallel-test" / slug / "timings.json"
 
@@ -202,6 +207,7 @@ def load_config(path: str) -> Config:
         run_command=run["command"],
         duration_regex=run.get("duration_regex"),
         seed_setup=seed.get("setup"),
+        seed_auto=bool(seed.get("auto", False)),
         docker_install=seed.get("docker_install"),
         clean_command=clean.get("command"),
         timings_file=timings_file,
@@ -824,6 +830,21 @@ def cmd_run(cfg: Config) -> RunResult:
     # Phase 1: rsync
     rsync_results = _parallel_rsync(cfg)
     rsync_ok_hosts = {r.host for r in rsync_results if r.ok}
+
+    # Auto-seed: run setup on machines after rsync (e.g. build Docker images)
+    if cfg.seed_auto and cfg.seed_setup:
+        ok_machines = [m for m in cfg.machines if m.host in rsync_ok_hosts]
+        if ok_machines:
+            _log("Auto-seeding machines...")
+            setup_results = _parallel_ssh(
+                ok_machines, cfg.seed_setup,
+                cfg.workdir, "seed", timeout=1800,
+            )
+            for sr in setup_results:
+                if not sr.ok:
+                    print(f"\n--- seed output ({sr.host}) ---\n{sr.output}---\n", file=sys.stderr)
+                    _die(f"Auto-seed failed on {sr.host}")
+            _log("Auto-seed complete.")
 
     # Phase 2: discover + schedule
     _log("Discovering tests...")

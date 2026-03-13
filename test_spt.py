@@ -4,6 +4,7 @@ No remote machines are contacted.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from unittest import mock
@@ -247,7 +248,15 @@ class TestLoadConfig:
     def test_timings_file_default(self, tmp_path):
         conf = _write_config(tmp_path)
         cfg = spt.load_config(str(conf))
-        assert cfg.timings_file == tmp_path / "timings.json"
+        # Slug derived from resolved config path
+        resolved = conf.resolve()
+        try:
+            rel = str(resolved.relative_to(Path.home()))
+        except ValueError:
+            rel = str(resolved)
+        slug = "-" + re.sub(r'[^a-zA-Z0-9-]', '-', rel)
+        expected = Path.home() / ".ssh-parallel-test" / slug / "timings.json"
+        assert cfg.timings_file == expected
 
     def test_timings_file_custom(self, tmp_path):
         conf = _write_config(tmp_path, {"timings_file": "custom-timings.json"})
@@ -479,7 +488,7 @@ class TestSetupSSH:
             machines=[], workdir="", ssh_key=tmp_path / "id_test",
             rsync_excludes=[], discover_command="", group_regex="",
             run_command="", duration_regex=None, seed_setup=None,
-            docker_install=None, clean_command=None,
+            seed_auto=False, docker_install=None, clean_command=None,
             timings_file=tmp_path / "t.json", root=tmp_path,
         )
         spt._setup_ssh(cfg)
@@ -492,7 +501,7 @@ class TestSetupSSH:
             machines=[], workdir="", ssh_key=None,
             rsync_excludes=[], discover_command="", group_regex="",
             run_command="", duration_regex=None, seed_setup=None,
-            docker_install=None, clean_command=None,
+            seed_auto=False, docker_install=None, clean_command=None,
             timings_file=tmp_path / "t.json", root=tmp_path,
         )
         spt._setup_ssh(cfg)
@@ -620,11 +629,13 @@ class TestParallelE2E:
 # ---------------------------------------------------------------------------
 
 class TestCmdRun:
+    @mock.patch("spt._save_timings")
+    @mock.patch("spt._load_timings", return_value={})
     @mock.patch("spt._check_ssh")
     @mock.patch("spt._parallel_e2e")
     @mock.patch("spt.discover_tests")
     @mock.patch("spt._parallel_rsync")
-    def test_pass(self, mock_rsync, mock_discover, mock_e2e, mock_ssh, sample_config):
+    def test_pass(self, mock_rsync, mock_discover, mock_e2e, mock_ssh, mock_load_t, mock_save_t, sample_config):
         mock_rsync.return_value = [
             spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
             spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
@@ -641,11 +652,13 @@ class TestCmdRun:
         assert result.passed_tests == 3
         assert all(r.ok for r in result.e2e_results)
 
+    @mock.patch("spt._save_timings")
+    @mock.patch("spt._load_timings", return_value={})
     @mock.patch("spt._check_ssh")
     @mock.patch("spt._parallel_e2e")
     @mock.patch("spt.discover_tests")
     @mock.patch("spt._parallel_rsync")
-    def test_rsync_fail_reduces_machines(self, mock_rsync, mock_discover, mock_e2e, mock_ssh, sample_config):
+    def test_rsync_fail_reduces_machines(self, mock_rsync, mock_discover, mock_e2e, mock_ssh, mock_load_t, mock_save_t, sample_config):
         mock_rsync.return_value = [
             spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
             spt.TaskResult("10.0.0.2", "", 0, False, 1.0, "connection refused"),
@@ -800,7 +813,7 @@ class TestTimings:
             machines=[], workdir="", ssh_key=None,
             rsync_excludes=[], discover_command="", group_regex="",
             run_command="", duration_regex=None, seed_setup=None,
-            docker_install=None, clean_command=None,
+            seed_auto=False, docker_install=None, clean_command=None,
             timings_file=tmp_path / "timings.json", root=tmp_path,
         )
         assert spt._load_timings(cfg) == {}
@@ -810,7 +823,7 @@ class TestTimings:
             machines=[], workdir="", ssh_key=None,
             rsync_excludes=[], discover_command="", group_regex="",
             run_command="", duration_regex=None, seed_setup=None,
-            docker_install=None, clean_command=None,
+            seed_auto=False, docker_install=None, clean_command=None,
             timings_file=tmp_path / "timings.json", root=tmp_path,
         )
         spt._save_timings(cfg, {"test1": 10.0, "test2": 20.0})
