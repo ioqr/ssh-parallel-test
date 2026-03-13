@@ -1,0 +1,47 @@
+# Example ssh-parallel-test configuration.
+# Copy to your project and customize.
+
+machines:
+  - host: 192.168.1.10
+    user: ubuntu
+    slots: 3            # max concurrent groups per machine
+  - host: 192.168.1.11
+    user: ubuntu
+    slots: 3
+
+remote:
+  workdir: ~/my-project
+
+ssh:
+  key: ~/.ssh/id_ed25519
+
+rsync:
+  excludes:
+    - ".git/"
+    - "__pycache__/"
+    - "*.pyc"
+    - ".venv/"
+
+# Test discovery — command that outputs test IDs, one per line.
+# {root} is replaced with the project root directory (cwd).
+discover:
+  command: "pytest --collect-only -q"
+  group_regex: "(group1|group2|group3)"  # first capture group = group name
+
+# Test execution — command run on remote machines.
+# {tests} = space-separated test IDs, {group} = group name.
+run:
+  command: "pytest {tests} -v --durations=0"
+  duration_regex: "\\s*([\\d.]+)s call\\s+(.+)"  # optional: parse durations
+
+# Machine setup (run by 'seed' command)
+seed:
+  setup: "make build"
+  docker_install: "curl -fsSL https://get.docker.com | sudo sh"
+
+# Cleanup (run by 'clean' command)
+clean:
+  command: "make clean"
+
+# Timings file path (relative to config dir, default: timings.json)
+# timings_file: timings.json
