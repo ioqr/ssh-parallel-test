@@ -1,13 +1,14 @@
 # ssh-parallel-test — lightweight image with SSH, rsync, and Docker CLI.
 #
+# Published to ghcr.io/ioqr/ssh-parallel-test:latest on every push to main.
+#
 # Usage:
-#   docker build -t spt .
 #   docker run --rm \
 #     -v /var/run/docker.sock:/var/run/docker.sock \
 #     -v $(pwd):$(pwd) -v ~/.ssh:/root/.ssh:ro \
 #     -v ~/.ssh-parallel-test:/root/.ssh-parallel-test \
 #     --network host -w $(pwd) \
-#     spt -c config.yml run
+#     ghcr.io/ioqr/ssh-parallel-test:latest -c config.yml run
 
 FROM python:3.12-slim-bookworm
 

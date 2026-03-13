@@ -51,8 +51,7 @@ machines:
 ### Makefile integration
 
 ```makefile
-SPT_DIR ?= $(HOME)/ssh-parallel-test
-SPT_IMAGE := spt:latest
+SPT_IMAGE := ghcr.io/ioqr/ssh-parallel-test:latest
 REMOTE_CFG ?= path/to/config.yml
 SPT_RUN := docker run --rm -e HOME=$(HOME) \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -61,10 +60,7 @@ SPT_RUN := docker run --rm -e HOME=$(HOME) \
   -v $(HOME)/.ssh-parallel-test:$(HOME)/.ssh-parallel-test \
   --network host -w $(CURDIR) $(SPT_IMAGE)
 
-_build-spt:
-	docker build -t $(SPT_IMAGE) $(SPT_DIR)
-
-remote-run: _build-spt
+remote-run:
 	$(SPT_RUN) -c $(REMOTE_CFG) run
 ```
 

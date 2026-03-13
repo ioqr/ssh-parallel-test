@@ -22,19 +22,15 @@ need Docker installed.
 ## Quick start
 
 ```bash
-git clone git@github.com:ioqr/ssh-parallel-test.git ~/ssh-parallel-test
-cd ~/ssh-parallel-test
-docker build -t spt .
-
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v $(pwd):$(pwd) -v ~/.ssh:/root/.ssh:ro \
   -v ~/.ssh-parallel-test:/root/.ssh-parallel-test \
   --network host -w $(pwd) \
-  spt -c config.yml run
+  ghcr.io/ioqr/ssh-parallel-test:latest -c config.yml run
 ```
 
-No host dependencies beyond Docker.
+No host dependencies beyond Docker. The image is published to GHCR on every push to main.
 
 ## Config format
 
@@ -113,9 +109,9 @@ discover, run, seed, clean go in the shared project file.
 ## Timings and scheduling
 
 Historical timings are auto-collected from test output via `duration_regex`
-and stored in `~/.ssh-parallel-test/<project-slug>/timings.json` (derived from
-cwd, e.g. `~/.ssh-parallel-test/-w-my-project/timings.json`). Override with
-`timings_file:` in config. Without timings, tests are distributed round-robin.
+and stored in `~/.ssh-parallel-test/<config-slug>/timings.json` (derived from
+the resolved config file path, so each cluster gets its own timings). Override
+with `timings_file:` in config. Without timings, tests are distributed round-robin.
 
 With timings, the LPT scheduler assigns the heaviest tests first to the
 least-loaded machine, minimizing overall wall time.
