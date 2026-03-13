@@ -32,7 +32,9 @@ run:
   duration_regex: "\\s*([\\d.]+)s call\\s+(.+)"
 
 seed:
+  auto: true
   setup: "make build"
+  docker_install: "curl -fsSL https://get.docker.com | sudo sh"
 
 clean:
   command: "make clean"

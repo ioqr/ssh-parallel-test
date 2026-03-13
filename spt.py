@@ -831,7 +831,10 @@ def cmd_run(cfg: Config) -> RunResult:
     rsync_results = _parallel_rsync(cfg)
     rsync_ok_hosts = {r.host for r in rsync_results if r.ok}
 
-    # Auto-seed: run setup on machines after rsync (e.g. build Docker images)
+    # Auto-seed: install Docker if needed, then run setup (e.g. build images)
+    if cfg.seed_auto:
+        _ensure_docker(cfg)
+
     if cfg.seed_auto and cfg.seed_setup:
         ok_machines = [m for m in cfg.machines if m.host in rsync_ok_hosts]
         if ok_machines:

@@ -66,8 +66,9 @@ run:
   command: "pytest {tests} -v --durations=0"
   duration_regex: "\\s*([\\d.]+)s call\\s+(.+)"  # optional: parse timings
 
-# Machine setup (run by 'seed' command)
+# Machine setup (run by 'seed' command, or automatically by 'run' with auto: true)
 seed:
+  auto: true   # run seed automatically during 'run' (install Docker + setup)
   setup: "make build"
   docker_install: "curl -fsSL https://get.docker.com | sudo sh"
 
