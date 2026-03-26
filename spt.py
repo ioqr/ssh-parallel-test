@@ -1101,11 +1101,7 @@ def cmd_estimate(cfg: Config) -> None:
 
 
 def cmd_status(cfg: Config) -> None:
-    print()
-    print(f"  {'host':<17} {'user':<15} {'slots':>5}  {'ssh':<6} {'docker':<12}")
-    print(f"  {'─' * 17} {'─' * 15} {'─' * 5}  {'─' * 6} {'─' * 12}")
-
-    for m in cfg.machines:
+    def _check(m: Machine):
         reachable = ssh_check(m.ssh_dest)
         if reachable:
             ssh_ok = f"{_GREEN}ok{_RESET}"
@@ -1117,12 +1113,19 @@ def cmd_status(cfg: Config) -> None:
         else:
             ssh_ok = f"{_RED}no{_RESET}"
             docker_ver = "-"
+        return m, ssh_ok, docker_ver
 
+    with ThreadPoolExecutor(max_workers=len(cfg.machines)) as pool:
+        results = list(pool.map(_check, cfg.machines))
+
+    print()
+    print(f"  {'host':<17} {'user':<15} {'slots':>5}  {'ssh':<6} {'docker':<12}")
+    print(f"  {'─' * 17} {'─' * 15} {'─' * 5}  {'─' * 6} {'─' * 12}")
+    for m, ssh_ok, docker_ver in results:
         print(
             f"  {m.host:<17} {m.user:<15} {m.slots:>5}  "
             f"{ssh_ok:<15} {docker_ver}"
         )
-
     print()
 
 
