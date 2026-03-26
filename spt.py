@@ -527,7 +527,9 @@ _SSH_OPTS: list[str] = []
 
 def _setup_ssh(cfg: Config) -> None:
     global _SSH_OPTS
-    ctrl_dir = "/tmp/spt-ssh"
+    # Use /run for control sockets - it's a tmpfs inside the container,
+    # not a macOS volume mount (Unix sockets fail on mounted /tmp).
+    ctrl_dir = "/run/spt-ssh"
     os.makedirs(ctrl_dir, exist_ok=True)
     opts = [
         "-o", "StrictHostKeyChecking=no",
