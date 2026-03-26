@@ -527,10 +527,14 @@ _SSH_OPTS: list[str] = []
 
 def _setup_ssh(cfg: Config) -> None:
     global _SSH_OPTS
-    # Use /run for control sockets - it's a tmpfs inside the container,
-    # not a macOS volume mount (Unix sockets fail on mounted /tmp).
-    ctrl_dir = "/run/spt-ssh"
-    os.makedirs(ctrl_dir, exist_ok=True)
+    # Control sockets need a tmpfs (Unix sockets fail on macOS volume
+    # mounts). Try /run first (container tmpfs), fall back to ~/.spt-ssh.
+    for ctrl_dir in ("/run/spt-ssh", os.path.expanduser("~/.spt-ssh")):
+        try:
+            os.makedirs(ctrl_dir, exist_ok=True)
+            break
+        except PermissionError:
+            continue
     opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
