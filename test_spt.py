@@ -3,9 +3,11 @@ Tests for spt.py - all SSH and subprocess calls are mocked.
 No remote machines are contacted.
 """
 
+import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -901,6 +903,63 @@ class TestTimings:
         )
         spt._save_timings(cfg, {"t": 1.0})
         assert spt._load_timings(cfg) == {"t": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Cluster locking
+# ---------------------------------------------------------------------------
+
+def _lock_cfg(tmp_path):
+    return spt.Config(
+        machines=[], workdir="", ssh_key=None,
+        rsync_excludes=[], discover_command="", group_regex="",
+        run_command="", duration_regex=None, seed_setup=None,
+        seed_auto=False, docker_install=None, clean_command=None,
+        timings_file=tmp_path / "timings.json", root=tmp_path,
+    )
+
+
+class TestLocking:
+    def test_acquire_and_release(self, tmp_path):
+        cfg = _lock_cfg(tmp_path)
+        spt._acquire_lock(cfg)
+        lock = spt._lock_path(cfg)
+        assert lock.exists()
+        info = json.loads(lock.read_text())
+        assert "id" in info
+        assert "pid" in info
+        assert "timestamp" in info
+        spt._release_lock(cfg)
+        assert not lock.exists()
+
+    def test_stale_lock_taken_over(self, tmp_path):
+        cfg = _lock_cfg(tmp_path)
+        lock = spt._lock_path(cfg)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({
+            "id": "old-run",
+            "host": "other-host",
+            "pid": 99999,
+            "timestamp": time.time() - spt.LOCK_STALE_SECS - 1,
+        }))
+        spt._acquire_lock(cfg)
+        info = json.loads(lock.read_text())
+        assert info["id"] != "old-run"
+        spt._release_lock(cfg)
+
+    def test_corrupt_lock_taken_over(self, tmp_path):
+        cfg = _lock_cfg(tmp_path)
+        lock = spt._lock_path(cfg)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("not json")
+        spt._acquire_lock(cfg)
+        assert lock.exists()
+        spt._release_lock(cfg)
+
+    def test_release_missing_lock(self, tmp_path):
+        cfg = _lock_cfg(tmp_path)
+        # Should not raise
+        spt._release_lock(cfg)
 
 
 # ---------------------------------------------------------------------------

@@ -216,6 +216,61 @@ def load_config(path: str) -> Config:
 
 
 # ---------------------------------------------------------------------------
+# Cluster locking
+# ---------------------------------------------------------------------------
+
+LOCK_STALE_SECS = 7200  # 2 hours — assume dead if older than this
+
+import uuid as _uuid
+import socket as _socket
+
+
+def _lock_path(cfg: Config) -> Path:
+    return cfg.timings_file.parent / "lock.json"
+
+
+def _acquire_lock(cfg: Config) -> None:
+    """Acquire an exclusive lock for this cluster. Waits if another run is active."""
+    lock = _lock_path(cfg)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    my_id = str(_uuid.uuid4())[:8]
+
+    while True:
+        if lock.exists():
+            try:
+                info = json.loads(lock.read_text())
+                age = time.time() - info.get("timestamp", 0)
+                owner = info.get("id", "unknown")
+                host = info.get("host", "unknown")
+
+                if age > LOCK_STALE_SECS:
+                    _log(f"Stale lock from {owner}@{host} ({_fmt_duration(age)} ago), taking over")
+                    break
+
+                _log(f"Waiting for run {owner}@{host} ({_fmt_duration(age)} ago)...")
+                time.sleep(5)
+                continue
+            except (json.JSONDecodeError, KeyError):
+                break
+        else:
+            break
+
+    lock.write_text(json.dumps({
+        "id": my_id,
+        "host": _socket.gethostname(),
+        "pid": os.getpid(),
+        "timestamp": time.time(),
+    }))
+    _log(f"Acquired lock {my_id}")
+
+
+def _release_lock(cfg: Config) -> None:
+    lock = _lock_path(cfg)
+    if lock.exists():
+        lock.unlink()
+
+
+# ---------------------------------------------------------------------------
 # Test timings (for intelligent scheduling)
 # ---------------------------------------------------------------------------
 
@@ -855,6 +910,14 @@ def cmd_seed(cfg: Config) -> None:
 
 
 def cmd_run(cfg: Config) -> RunResult:
+    _acquire_lock(cfg)
+    try:
+        return _cmd_run_inner(cfg)
+    finally:
+        _release_lock(cfg)
+
+
+def _cmd_run_inner(cfg: Config) -> RunResult:
     t0 = time.monotonic()
 
     _check_ssh(cfg)
