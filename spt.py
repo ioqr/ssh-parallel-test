@@ -288,41 +288,69 @@ def schedule(
     Each machine runs up to ``slots`` groups concurrently. Tests within each
     group are assigned using longest-processing-time-first scheduling when
     historical timings are available, otherwise round-robin.
+
+    All machines are eligible for all groups. The ``slots`` limit controls
+    how many distinct groups a machine can run concurrently, not which
+    groups it may receive.
     """
     if timings is None:
         timings = {}
-    groups = sorted(tests_by_group.keys())
+    if not machines or not tests_by_group:
+        return []
 
-    # Assign groups to machines (up to slots limit per machine).
-    group_machines: dict[str, list[Machine]] = {g: [] for g in groups}
-    for m in machines:
-        for g in groups[: m.slots]:
-            group_machines[g].append(m)
+    machine_by_host = {m.host: m for m in machines}
 
-    # LPT bin packing: sort tests longest-first, assign each to the
-    # least-loaded eligible machine.
+    # Global LPT: flatten all tests, sort longest-first, assign each to
+    # the least-loaded machine that can accept the test's group (either
+    # already running that group, or has a free slot).
+    all_tests = []
+    for group, tests in sorted(tests_by_group.items()):
+        for t in tests:
+            all_tests.append((group, t))
+
+    all_tests.sort(
+        key=lambda gt: timings.get(gt[1], DEFAULT_TEST_DURATION),
+        reverse=True,
+    )
+
+    machine_load: dict[str, float] = {m.host: 0.0 for m in machines}
+    machine_groups: dict[str, set[str]] = {m.host: set() for m in machines}
     assignments: dict[tuple[str, str], TestAssignment] = {}
-    for group in groups:
-        eligible = group_machines[group]
-        tests = tests_by_group.get(group, [])
-        if not eligible or not tests:
-            continue
 
-        tests_sorted = sorted(
-            tests,
-            key=lambda t: timings.get(t, DEFAULT_TEST_DURATION),
-            reverse=True,
-        )
-        machine_load: dict[str, float] = {m.host: 0.0 for m in eligible}
-        machine_by_host = {m.host: m for m in eligible}
+    for group, test_id in all_tests:
+        dur = timings.get(test_id, DEFAULT_TEST_DURATION)
 
-        for test_id in tests_sorted:
-            min_host = min(machine_load, key=machine_load.get)
-            machine_load[min_host] += timings.get(test_id, DEFAULT_TEST_DURATION)
-            key = (min_host, group)
-            if key not in assignments:
-                assignments[key] = TestAssignment(machine_by_host[min_host], group, [])
-            assignments[key].test_ids.append(test_id)
+        # Find least-loaded machine that can accept this group:
+        # either already has this group, or has a free slot.
+        best_host = None
+        best_load = float("inf")
+        for m in machines:
+            can_accept = (
+                group in machine_groups[m.host]
+                or len(machine_groups[m.host]) < m.slots
+            )
+            if can_accept and machine_load[m.host] < best_load:
+                best_host = m.host
+                best_load = machine_load[m.host]
+
+        if best_host is None:
+            # All machines at slot capacity for new groups; pick least-loaded
+            # machine that already has this group.
+            for m in machines:
+                if group in machine_groups[m.host] and machine_load[m.host] < best_load:
+                    best_host = m.host
+                    best_load = machine_load[m.host]
+
+        if best_host is None:
+            # Last resort: least-loaded machine overall (exceed slots).
+            best_host = min(machine_load, key=machine_load.get)
+
+        machine_load[best_host] += dur
+        machine_groups[best_host].add(group)
+        key = (best_host, group)
+        if key not in assignments:
+            assignments[key] = TestAssignment(machine_by_host[best_host], group, [])
+        assignments[key].test_ids.append(test_id)
 
     return sorted(assignments.values(), key=lambda a: (a.machine.host, a.group))
 

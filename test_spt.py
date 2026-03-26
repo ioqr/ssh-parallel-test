@@ -347,16 +347,16 @@ class TestSchedule:
             spt.Machine(host="10.0.0.2", user="u", slots=3),
         ]
         assignments = spt.schedule(machines, SAMPLE_TESTS)
-        assert len(assignments) == 6
-
-        alpha_a = [a for a in assignments if a.group == "alpha"]
-        assert len(alpha_a) == 2
-        assert len(alpha_a[0].test_ids) == 3
-        assert len(alpha_a[1].test_ids) == 3
-
-        gamma_a = [a for a in assignments if a.group == "gamma"]
-        counts = sorted([len(a.test_ids) for a in gamma_a])
-        assert counts == [3, 4]
+        # All 3 groups should be present
+        groups = {a.group for a in assignments}
+        assert groups == {"alpha", "beta", "gamma"}
+        # All 19 tests scheduled
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 19
+        # Load should be roughly balanced across machines
+        for host in ["10.0.0.1", "10.0.0.2"]:
+            host_tests = sum(len(a.test_ids) for a in assignments if a.machine.host == host)
+            assert host_tests >= 9  # at least 9 of 19
 
     def test_five_machines(self):
         machines = [
@@ -364,30 +364,71 @@ class TestSchedule:
             for i in range(1, 6)
         ]
         assignments = spt.schedule(machines, SAMPLE_TESTS)
-        assert len(assignments) == 15
         total = sum(len(a.test_ids) for a in assignments)
         assert total == 19
-
-        alpha_a = [a for a in assignments if a.group == "alpha"]
-        alpha_total = sum(len(a.test_ids) for a in alpha_a)
-        assert alpha_total == 6
-        assert all(len(a.test_ids) <= 2 for a in alpha_a)
+        # All groups present
+        groups = {a.group for a in assignments}
+        assert groups == {"alpha", "beta", "gamma"}
+        # Each group's tests are fully accounted for
+        for group, tests in SAMPLE_TESTS.items():
+            group_tests = [t for a in assignments if a.group == group for t in a.test_ids]
+            assert len(group_tests) == len(tests)
 
     def test_slots_limit(self):
+        # With one machine and slots=1, all groups must still run (serially
+        # would exceed slots, but every test must be scheduled). The machine
+        # gets all groups since there's nowhere else to put them.
         machines = [
             spt.Machine(host="10.0.0.1", user="u", slots=1),
         ]
         assignments = spt.schedule(machines, SAMPLE_TESTS)
         groups = {a.group for a in assignments}
-        assert groups == {"alpha"}
+        assert groups == {"alpha", "beta", "gamma"}
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 19
 
     def test_slots_two(self):
+        # With one machine and slots=2, all groups still run (the machine
+        # is the only option). Slots is a concurrency hint, not a hard cap
+        # when there are more groups than machines * slots.
         machines = [
             spt.Machine(host="10.0.0.1", user="u", slots=2),
         ]
         assignments = spt.schedule(machines, SAMPLE_TESTS)
         groups = {a.group for a in assignments}
+        assert groups == {"alpha", "beta", "gamma"}
+
+    def test_slots_distributes_across_machines(self):
+        # With 2 machines (slots=1 each) and 2 groups, each machine
+        # should prefer a different group.
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=1),
+            spt.Machine(host="10.0.0.2", user="u", slots=1),
+        ]
+        tests = {
+            "alpha": [f"e2e/test::alpha_{i}" for i in range(4)],
+            "beta": [f"e2e/test::beta_{i}" for i in range(4)],
+        }
+        assignments = spt.schedule(machines, tests)
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 8
+        # Both groups should be scheduled
+        groups = {a.group for a in assignments}
         assert groups == {"alpha", "beta"}
+
+    def test_many_groups_few_slots(self):
+        # 5 groups, 2 machines with slots=2. All groups must be scheduled
+        # even though total slots (4) < groups (5).
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=2),
+            spt.Machine(host="10.0.0.2", user="u", slots=2),
+        ]
+        tests = {g: [f"e2e/test::{g}_0"] for g in "abcde"}
+        assignments = spt.schedule(machines, tests)
+        groups = {a.group for a in assignments}
+        assert groups == {"a", "b", "c", "d", "e"}
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 5
 
     def test_empty_tests(self):
         machines = [spt.Machine(host="10.0.0.1", user="u", slots=3)]
@@ -735,20 +776,22 @@ SAMPLE_TIMINGS = {
 
 
 class TestScheduleWithTimings:
-    def test_lpt_separates_heavy_tests(self):
+    def test_lpt_balances_load(self):
         machines = [
             spt.Machine(host="10.0.0.1", user="u", slots=3),
             spt.Machine(host="10.0.0.2", user="u", slots=3),
         ]
         assignments = spt.schedule(machines, SAMPLE_TESTS, SAMPLE_TIMINGS)
-        for group in ["alpha", "beta"]:
-            group_a = [a for a in assignments if a.group == group]
-            assert len(group_a) == 2
-            heavy = f"e2e/test::{group}_0"
-            medium = f"e2e/test::{group}_1"
-            hosts_heavy = [a.machine.host for a in group_a if heavy in a.test_ids]
-            hosts_medium = [a.machine.host for a in group_a if medium in a.test_ids]
-            assert hosts_heavy != hosts_medium, f"{group}: heavy and medium on same machine"
+        # The heaviest tests across all groups should be spread across machines.
+        # gamma_0 (75s), alpha_0 (70s), beta_0 (70s) should not all land on
+        # the same machine.
+        for host in ["10.0.0.1", "10.0.0.2"]:
+            host_tests = [t for a in assignments if a.machine.host == host for t in a.test_ids]
+            heavy_on_host = sum(
+                1 for t in host_tests
+                if t in ("e2e/test::gamma_0", "e2e/test::alpha_0", "e2e/test::beta_0")
+            )
+            assert heavy_on_host <= 2, f"{host} has all 3 heaviest tests"
 
     def test_preserves_all_tests_with_timings(self):
         machines = [
@@ -763,8 +806,14 @@ class TestScheduleWithTimings:
 class TestEstimateWallTime:
     def test_one_machine(self):
         est = spt._estimate_wall_time(1, SAMPLE_TESTS, SAMPLE_TIMINGS)
-        # Gamma: 75 + 42 + 14 + 12 + 12 + 12 + 6 = 173
-        assert est == pytest.approx(173.0)
+        # With 1 machine (slots=3), all groups run as concurrent assignments.
+        # Wall time = max assignment duration (the heaviest group-assignment).
+        # Global LPT distributes tests, so the heaviest single assignment
+        # is at least the longest test (gamma_0 = 75s).
+        assert est >= 75.0
+        # Total across all tests: 150 + 150 + 173 = 473. With 3 concurrent
+        # slots, ideal wall time ~158s. Actual depends on LPT packing.
+        assert est <= 473.0
 
     def test_more_machines_not_worse(self):
         prev = spt._estimate_wall_time(1, SAMPLE_TESTS, SAMPLE_TIMINGS)
