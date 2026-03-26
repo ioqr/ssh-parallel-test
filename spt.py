@@ -266,21 +266,25 @@ def _try_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
         return False
 
 
-def _read_lock_info(dest: str, lock_dir: str) -> dict:
-    """Read and parse lock info from a remote machine."""
+def _read_lock_info(dest: str, lock_dir: str) -> dict | None:
+    """Read and parse lock info from a remote machine. Returns None on SSH failure."""
     try:
         r = subprocess.run(
             ["ssh", *_SSH_OPTS, dest, f"cat {lock_dir}/info 2>/dev/null"],
             capture_output=True, text=True, timeout=15,
         )
+        if r.returncode == 255:
+            return None  # SSH connection failed
         return _parse_lock_info(r.stdout)
     except (subprocess.TimeoutExpired, OSError):
-        return {}
+        return None
 
 
-def _check_lock_stale(dest: str, lock_dir: str) -> bool:
-    """Check if an existing lock is stale. Returns True if stale."""
+def _check_lock_stale(dest: str, lock_dir: str) -> bool | None:
+    """Check if an existing lock is stale. Returns True if stale, None if unknown."""
     info = _read_lock_info(dest, lock_dir)
+    if info is None:
+        return None  # can't tell, SSH failed
     try:
         ts = float(info.get("ts", "0"))
         age = time.time() - ts
@@ -330,10 +334,15 @@ def _try_lock_machines(
                 return m
             # Lock exists - check if it belongs to us (re-run after crash)
             info = _read_lock_info(m.ssh_dest, lock_dir)
+            if info is None:
+                return None  # SSH failed, skip this machine
             if info.get("id") == run_id:
                 return m  # we already own it
             # Check for stale lock
-            if _check_lock_stale(m.ssh_dest, lock_dir):
+            stale = _check_lock_stale(m.ssh_dest, lock_dir)
+            if stale is None:
+                return None  # SSH failed
+            if stale:
                 _log(f"Stale lock on {m.host}, taking over")
                 if _force_lock_machine(m.ssh_dest, lock_dir, run_id):
                     return m
@@ -647,7 +656,7 @@ def print_summary(result: RunResult) -> None:
     print(f"  {'=' * 68}")
     failed = [r for r in result.e2e_results if not r.ok]
     if failed:
-        fail_desc = ", ".join(f"{r.group}@{r.host}" for r in failed)
+        fail_desc = ", ".join(f"{r.group} on {r.host}" for r in failed)
         print(f"  {_RED}{_BOLD}result: FAIL ({passed}/{total} passed, failed: {fail_desc}){_RESET}")
     else:
         print(f"  {_GREEN}{_BOLD}result: PASS ({passed}/{total} tests){_RESET}")
@@ -892,7 +901,7 @@ def _parallel_e2e(
         # Log final results after dashboard clears
         for r in sorted(results, key=lambda r: (r.group, r.host)):
             tag = f"{_GREEN}PASS{_RESET}" if r.ok else f"{_RED}FAIL{_RESET}"
-            _log(f"e2e    {r.group} ({r.test_count} tests) @ {r.host} {tag} ({_fmt_duration(r.duration)})")
+            _log(f"e2e    {r.group} ({r.test_count} tests) on {r.host} {tag} ({_fmt_duration(r.duration)})")
 
         return sorted(results, key=lambda r: (r.host, r.group))
 
@@ -1105,6 +1114,9 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     run_id = str(_uuid.uuid4())[:8]
     lock_dir = _lock_dir(cfg)
 
+    # Establish ControlMaster connections and drop unreachable machines
+    _check_ssh(cfg)
+
     # Discover tests upfront
     _log("Discovering tests...")
     tests_by_group = discover_tests(cfg)
@@ -1180,7 +1192,7 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
 
                 tag = f"{_GREEN}PASS{_RESET}" if result.ok else f"{_RED}FAIL{_RESET}"
                 tests_label = ", ".join(a.test_ids) if len(a.test_ids) <= 3 else f"{len(a.test_ids)} tests"
-                _log(f"e2e    {result.group} / {tests_label} @ {result.host} {tag} ({_fmt_duration(result.duration)})")
+                _log(f"e2e    {result.group} / {tests_label} on {result.host} {tag} ({_fmt_duration(result.duration)})")
 
             # If we have pending tests but no machines available, wait
             if any(remaining.values()) and not done:
@@ -1228,7 +1240,7 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     for r in all_e2e_results:
         if not r.ok and r.output:
             print(f"\n{'=' * 60}", file=sys.stderr)
-            print(f"  FAILED: {r.group} @ {r.host}", file=sys.stderr)
+            print(f"  FAILED: {r.group} on {r.host}", file=sys.stderr)
             print(f"{'=' * 60}", file=sys.stderr)
             print(r.output, file=sys.stderr)
 
