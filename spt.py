@@ -527,12 +527,17 @@ _SSH_OPTS: list[str] = []
 
 def _setup_ssh(cfg: Config) -> None:
     global _SSH_OPTS
+    ctrl_dir = "/tmp/spt-ssh"
+    os.makedirs(ctrl_dir, exist_ok=True)
     opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
+        "-o", f"ControlPath={ctrl_dir}/%r@%h:%p",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=300",
     ]
     if cfg.ssh_key:
         opts += ["-o", "IdentitiesOnly=yes", "-i", str(cfg.ssh_key)]
