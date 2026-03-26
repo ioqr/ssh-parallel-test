@@ -253,23 +253,34 @@ def _parse_lock_info(raw: str) -> dict:
 def _try_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
     """Try to atomically lock a remote machine. Returns True if acquired."""
     info = _lock_info(run_id)
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, dest,
-         f"mkdir -p $(dirname {lock_dir}) && mkdir {lock_dir} 2>/dev/null"
-         f" && echo '{info}' > {lock_dir}/info && echo LOCKED"
-         f" || echo BUSY"],
-        capture_output=True, text=True, timeout=15,
-    )
-    return "LOCKED" in r.stdout
+    try:
+        r = subprocess.run(
+            ["ssh", *_SSH_OPTS, dest,
+             f"mkdir -p $(dirname {lock_dir}) && mkdir {lock_dir} 2>/dev/null"
+             f" && echo '{info}' > {lock_dir}/info && echo LOCKED"
+             f" || echo BUSY"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return "LOCKED" in r.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _read_lock_info(dest: str, lock_dir: str) -> dict:
+    """Read and parse lock info from a remote machine."""
+    try:
+        r = subprocess.run(
+            ["ssh", *_SSH_OPTS, dest, f"cat {lock_dir}/info 2>/dev/null"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return _parse_lock_info(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
 
 
 def _check_lock_stale(dest: str, lock_dir: str) -> bool:
     """Check if an existing lock is stale. Returns True if stale."""
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, dest, f"cat {lock_dir}/info 2>/dev/null"],
-        capture_output=True, text=True, timeout=15,
-    )
-    info = _parse_lock_info(r.stdout)
+    info = _read_lock_info(dest, lock_dir)
     try:
         ts = float(info.get("ts", "0"))
         age = time.time() - ts
@@ -281,20 +292,30 @@ def _check_lock_stale(dest: str, lock_dir: str) -> bool:
 def _force_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
     """Force-acquire a lock (for stale lock takeover)."""
     info = _lock_info(run_id)
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, dest,
-         f"rm -rf {lock_dir} && mkdir {lock_dir} && echo '{info}' > {lock_dir}/info && echo LOCKED"],
-        capture_output=True, text=True, timeout=15,
-    )
-    return "LOCKED" in r.stdout
+    try:
+        r = subprocess.run(
+            ["ssh", *_SSH_OPTS, dest,
+             f"rm -rf {lock_dir} && mkdir {lock_dir} && echo '{info}' > {lock_dir}/info && echo LOCKED"],
+            capture_output=True, text=True, timeout=15,
+        )
+        ok = "LOCKED" in r.stdout
+        if not ok:
+            _log(f"{_YELLOW}warning:{_RESET} force-lock failed on {dest}: rc={r.returncode} stderr={r.stderr.strip()}")
+        return ok
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _log(f"{_YELLOW}warning:{_RESET} force-lock SSH failed on {dest}: {e}")
+        return False
 
 
 def _unlock_machine(dest: str, lock_dir: str) -> None:
     """Release the lock on a remote machine."""
-    subprocess.run(
-        ["ssh", *_SSH_OPTS, dest, f"rm -rf {lock_dir}"],
-        capture_output=True, timeout=15,
-    )
+    try:
+        subprocess.run(
+            ["ssh", *_SSH_OPTS, dest, f"rm -rf {lock_dir}"],
+            capture_output=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def _try_lock_machines(
@@ -304,17 +325,30 @@ def _try_lock_machines(
     locked = []
 
     def _try(m: Machine) -> Machine | None:
-        if _try_lock_machine(m.ssh_dest, lock_dir, run_id):
-            return m
-        # Check for stale lock
-        if _check_lock_stale(m.ssh_dest, lock_dir):
-            _log(f"Stale lock on {m.host}, taking over")
-            if _force_lock_machine(m.ssh_dest, lock_dir, run_id):
+        try:
+            if _try_lock_machine(m.ssh_dest, lock_dir, run_id):
                 return m
-        return None
+            # Lock exists - check if it belongs to us (re-run after crash)
+            info = _read_lock_info(m.ssh_dest, lock_dir)
+            if info.get("id") == run_id:
+                return m  # we already own it
+            # Check for stale lock
+            if _check_lock_stale(m.ssh_dest, lock_dir):
+                _log(f"Stale lock on {m.host}, taking over")
+                if _force_lock_machine(m.ssh_dest, lock_dir, run_id):
+                    return m
+            else:
+                owner = info.get("host", "unknown")
+                _log(f"{m.host}: locked by {owner}")
+            return None
+        except Exception as e:
+            _log(f"{_YELLOW}warning:{_RESET} lock check failed for {m.host}: {e}")
+            return None
 
     with ThreadPoolExecutor(max_workers=max(1, len(machines))) as pool:
-        for result in pool.map(_try, machines):
+        futs = {pool.submit(_try, m): m for m in machines}
+        for fut in as_completed(futs):
+            result = fut.result()
             if result is not None:
                 locked.append(result)
 
@@ -324,7 +358,24 @@ def _try_lock_machines(
 def _unlock_machines(machines: list[Machine], lock_dir: str) -> None:
     """Release locks on multiple machines in parallel."""
     with ThreadPoolExecutor(max_workers=max(1, len(machines))) as pool:
-        pool.map(lambda m: _unlock_machine(m.ssh_dest, lock_dir), machines)
+        list(pool.map(lambda m: _unlock_machine(m.ssh_dest, lock_dir), machines))
+
+
+def cmd_clean_locks(cfg: Config) -> None:
+    """Remove all locks from all machines."""
+    lock_dir = _lock_dir(cfg)
+    _log(f"Cleaning locks from {len(cfg.machines)} machine(s)...")
+
+    def _clean(m: Machine) -> str:
+        info = _read_lock_info(m.ssh_dest, lock_dir)
+        _unlock_machine(m.ssh_dest, lock_dir)
+        if info:
+            return f"  {m.host}: removed (was: {info.get('id', '?')} by {info.get('host', '?')})"
+        return f"  {m.host}: clean"
+
+    with ThreadPoolExecutor(max_workers=max(1, len(cfg.machines))) as pool:
+        for msg in pool.map(_clean, cfg.machines):
+            print(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1103,12 +1154,24 @@ def cmd_run(cfg: Config) -> RunResult:
                     _log(f"All machines busy, waiting {LOCK_POLL_SECS}s...")
                 time.sleep(LOCK_POLL_SECS)
 
+    except KeyboardInterrupt:
+        _log(f"{_YELLOW}interrupted{_RESET} - cleaning up locks...")
+        interrupted = True
+    else:
+        interrupted = False
     finally:
-        # Always unlock everything we hold
+        # Always unlock everything we hold - suppress additional interrupts
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         to_unlock = [m for m in all_machines if m.host in locked_hosts]
         if to_unlock:
             _unlock_machines(to_unlock, lock_dir)
+            _log(f"Released {len(to_unlock)} lock(s)")
         executor.shutdown(wait=False)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    if interrupted:
+        raise KeyboardInterrupt
 
     # Collect timings from output
     for r in all_e2e_results:
@@ -1364,6 +1427,7 @@ def main() -> None:
     sub.add_parser("seed", help="rsync + setup machines")
     sub.add_parser("run", help="rsync + discover + distribute + run tests")
     sub.add_parser("clean", help="Run cleanup on remotes")
+    sub.add_parser("clean-locks", help="Remove all remote locks")
 
     bench_p = sub.add_parser("bench", help="Run N iterations, report min/avg/max")
     bench_p.add_argument(
@@ -1394,6 +1458,8 @@ def main() -> None:
                 sys.exit(1)
         case "clean":
             cmd_clean(cfg)
+        case "clean-locks":
+            cmd_clean_locks(cfg)
         case "bench":
             cmd_bench(cfg, args.n)
         case "estimate":
