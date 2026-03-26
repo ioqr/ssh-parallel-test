@@ -1060,20 +1060,42 @@ def _prep_machines(cfg: Config, machines: list[Machine]) -> list[Machine]:
     if not ok:
         return [], rsync_results
 
-    # auto-seed
+    # auto-seed (skip if workdir content unchanged since last seed)
     if cfg.seed_auto:
         _ensure_docker(cfg)
     if cfg.seed_auto and cfg.seed_setup:
-        _log(f"Auto-seeding {len(ok)} machine(s)...")
-        setup_results = _parallel_ssh(ok, cfg.seed_setup, cfg.workdir, "seed", timeout=1800, progress_interval=30)
-        failed = [sr for sr in setup_results if not sr.ok]
-        for sr in failed:
-            print(f"\n--- seed output ({sr.host}) ---\n{sr.output}---\n", file=sys.stderr)
-            _log(f"{_YELLOW}warning:{_RESET} seed failed on {sr.host}, skipping")
-        failed_hosts = {sr.host for sr in failed}
-        ok = [m for m in ok if m.host not in failed_hosts]
+        # Check which machines actually need seeding
+        hash_cmd = f"cd {cfg.workdir} && find . -type f ! -path './.spt-*' -newer .spt-seed-done 2>/dev/null | head -1"
+        need_seed = []
+        skip_seed = []
+
+        def _check_seed(m: Machine) -> tuple[Machine, bool]:
+            r = ssh_run(m.ssh_dest, hash_cmd, timeout=30)
+            needs = bool(r.stdout.strip()) or r.returncode != 0
+            return m, needs
+
+        with ThreadPoolExecutor(max_workers=max(1, len(ok))) as pool:
+            for m, needs in pool.map(_check_seed, ok):
+                if needs:
+                    need_seed.append(m)
+                else:
+                    skip_seed.append(m)
+
+        if skip_seed:
+            _log(f"Seed up-to-date on {len(skip_seed)} machine(s), skipping")
+
+        if need_seed:
+            _log(f"Auto-seeding {len(need_seed)} machine(s)...")
+            seed_cmd = f"{cfg.seed_setup} && touch .spt-seed-done"
+            setup_results = _parallel_ssh(need_seed, seed_cmd, cfg.workdir, "seed", timeout=1800, progress_interval=30)
+            failed = [sr for sr in setup_results if not sr.ok]
+            for sr in failed:
+                print(f"\n--- seed output ({sr.host}) ---\n{sr.output}---\n", file=sys.stderr)
+                _log(f"{_YELLOW}warning:{_RESET} seed failed on {sr.host}, skipping")
+            failed_hosts = {sr.host for sr in failed}
+            ok = [m for m in ok if m.host not in failed_hosts]
         if ok:
-            _log("Auto-seed complete.")
+            _log("Seed complete.")
 
     return ok, rsync_results
 
@@ -1128,7 +1150,8 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
                         if assignments:
                             _log(f"Scheduled {len(assignments)} tasks:")
                             for a in assignments:
-                                _log(f"  {a.machine.host} / {a.group}: {len(a.test_ids)} tests")
+                                tests_label = ", ".join(a.test_ids) if len(a.test_ids) <= 3 else f"{len(a.test_ids)} tests"
+                                _log(f"  {a.machine.host} / {a.group}: {tests_label}")
                                 # Remove assigned tests from remaining
                                 for t in a.test_ids:
                                     if t in remaining.get(a.group, []):
