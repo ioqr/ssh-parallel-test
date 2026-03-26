@@ -1285,8 +1285,10 @@ def cmd_clean(cfg: Config) -> None:
         _die("No clean.command configured")
     cmd_clean_locks(cfg)
     _log("Cleaning on all machines...")
+    # Remove seed marker so next run re-seeds
+    clean_cmd = f"rm -f {cfg.workdir}/.spt-seed-done && {cfg.clean_command}"
     results = _parallel_ssh(
-        cfg.machines, cfg.clean_command, cfg.workdir, "clean", timeout=120,
+        cfg.machines, clean_cmd, cfg.workdir, "clean", timeout=120,
     )
     for r in results:
         if not r.ok:
