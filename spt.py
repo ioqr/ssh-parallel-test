@@ -219,7 +219,7 @@ def load_config(path: str) -> Config:
 # Per-machine remote locking
 # ---------------------------------------------------------------------------
 
-LOCK_STALE_SECS = 7200  # 2 hours - assume dead if older than this
+LOCK_STALE_SECS = 1800  # 30 min - assume dead if older than this
 LOCK_POLL_SECS = 10
 
 import uuid as _uuid
@@ -544,6 +544,9 @@ def _setup_ssh(cfg: Config) -> None:
         "-o", "BatchMode=yes",
     ]
     if cfg.ssh_key:
+        if not cfg.ssh_key.exists():
+            _log(f"{_RED}error:{_RESET} ssh key not found: {cfg.ssh_key}")
+            raise SystemExit(1)
         opts += ["-o", "IdentitiesOnly=yes", "-i", str(cfg.ssh_key)]
     _SSH_OPTS = opts
 
@@ -1199,6 +1202,14 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
             # If we have pending tests but no machines available, wait
             if any(remaining.values()) and not done:
                 if not running:
+                    # Show who holds the locks
+                    for m in unlocked[:3]:
+                        info = _read_lock_info(m.ssh_dest, lock_dir)
+                        if info:
+                            owner = info.get("host", "?")
+                            ts = float(info.get("ts", 0))
+                            age = int(time.time() - ts)
+                            _log(f"  {m.host}: locked by {owner} ({age}s ago)")
                     _log(f"All machines busy, waiting {LOCK_POLL_SECS}s...")
                 time.sleep(LOCK_POLL_SECS)
 
