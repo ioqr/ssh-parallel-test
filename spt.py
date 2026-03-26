@@ -846,7 +846,6 @@ def _run_assignment(cfg: Config, a: TestAssignment) -> TaskResult:
     tests = " ".join(a.test_ids)
     cmd = cfg.run_command.format(tests=tests, group=a.group)
 
-    _log(f"e2e    {a.group} ({len(a.test_ids)} tests) @ {a.machine.ssh_dest}")
     t0 = time.monotonic()
     try:
         r = ssh_run(a.machine.ssh_dest, cmd, workdir=cfg.workdir, timeout=1800)
@@ -856,8 +855,6 @@ def _run_assignment(cfg: Config, a: TestAssignment) -> TaskResult:
         ok = False
         output = "SSH command timed out (1800s)"
     dur = time.monotonic() - t0
-    status = f"{_GREEN}PASS{_RESET}" if ok else f"{_RED}FAIL{_RESET}"
-    _log(f"e2e    {a.group} ({len(a.test_ids)} tests) @ {a.machine.ssh_dest} {status} ({_fmt_duration(dur)})")
     return TaskResult(a.machine.host, a.group, len(a.test_ids), ok, dur, output)
 
 
@@ -1161,7 +1158,8 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
                     locked_hosts.discard(a.machine.host)
 
                 tag = f"{_GREEN}PASS{_RESET}" if result.ok else f"{_RED}FAIL{_RESET}"
-                _log(f"e2e    {result.group} ({result.test_count} tests) @ {result.host} {tag} ({_fmt_duration(result.duration)})")
+                tests_label = ", ".join(a.test_ids) if len(a.test_ids) <= 3 else f"{len(a.test_ids)} tests"
+                _log(f"e2e    {result.group} / {tests_label} @ {result.host} {tag} ({_fmt_duration(result.duration)})")
 
             # If we have pending tests but no machines available, wait
             if any(remaining.values()) and not done:
