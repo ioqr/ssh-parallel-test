@@ -1121,8 +1121,11 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     _log(f"Checking SSH to {len(cfg.machines)} machine(s)...")
     failed = []
     for m in cfg.machines:
-        r = ssh_run(m.ssh_dest, "true", timeout=10)
-        if r.returncode != 0:
+        try:
+            r = ssh_run(m.ssh_dest, "true", timeout=10)
+            if r.returncode != 0:
+                failed.append(m)
+        except (subprocess.TimeoutExpired, OSError):
             failed.append(m)
     if failed:
         hosts = ", ".join(m.host for m in failed)
