@@ -572,8 +572,11 @@ def ssh_run(
 def ssh_check(dest: str) -> bool:
     try:
         r = subprocess.run(
-            ["ssh", *_SSH_OPTS, "-o", "ConnectTimeout=5", dest, "true"],
-            capture_output=True, timeout=10,
+            ["ssh", *_SSH_OPTS, dest, "true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
         )
         return r.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
