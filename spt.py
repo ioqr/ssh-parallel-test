@@ -1122,7 +1122,10 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     failed = []
     for m in cfg.machines:
         try:
-            r = ssh_run(m.ssh_dest, "true", timeout=10)
+            r = subprocess.run(
+                ["ssh", *_SSH_OPTS, "-o", "ConnectTimeout=3", m.ssh_dest, "true"],
+                capture_output=True, timeout=5,
+            )
             if r.returncode != 0:
                 failed.append(m)
         except (subprocess.TimeoutExpired, OSError):
