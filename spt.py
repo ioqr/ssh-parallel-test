@@ -1226,10 +1226,7 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
             # If we have pending tests but no machines available, wait
             if any(remaining.values()) and not done:
                 if not running:
-                    lock_failures += 1
-                    if lock_failures > 3:
-                        _die("Could not acquire any machines after 3 attempts")
-                    _log(f"No machines available (attempt {lock_failures}/3), retrying in {LOCK_POLL_SECS}s...")
+                    _die("No machines available - all locked or SSH failed")
                 time.sleep(LOCK_POLL_SECS)
 
     except KeyboardInterrupt:
