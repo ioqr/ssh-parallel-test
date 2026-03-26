@@ -527,8 +527,10 @@ class TestSSHHelpers:
 
 class TestSetupSSH:
     def test_with_key(self, tmp_path):
+        key = tmp_path / "id_test"
+        key.touch()
         cfg = spt.Config(
-            machines=[], workdir="", ssh_key=tmp_path / "id_test",
+            machines=[], workdir="", ssh_key=key,
             rsync_excludes=[], discover_command="", group_regex="",
             run_command="", duration_regex=None, seed_setup=None,
             seed_auto=False, docker_install=None, clean_command=None,
@@ -536,8 +538,19 @@ class TestSetupSSH:
         )
         spt._setup_ssh(cfg)
         assert "-i" in spt._SSH_OPTS
-        assert str(tmp_path / "id_test") in spt._SSH_OPTS
+        assert str(key) in spt._SSH_OPTS
         assert "IdentitiesOnly=yes" in " ".join(spt._SSH_OPTS)
+
+    def test_missing_key(self, tmp_path):
+        cfg = spt.Config(
+            machines=[], workdir="", ssh_key=tmp_path / "id_missing",
+            rsync_excludes=[], discover_command="", group_regex="",
+            run_command="", duration_regex=None, seed_setup=None,
+            seed_auto=False, docker_install=None, clean_command=None,
+            timings_file=tmp_path / "t.json", root=tmp_path,
+        )
+        with pytest.raises(SystemExit):
+            spt._setup_ssh(cfg)
 
     def test_without_key(self, tmp_path):
         cfg = spt.Config(

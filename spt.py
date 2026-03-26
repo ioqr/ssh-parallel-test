@@ -1264,6 +1264,7 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
 def cmd_clean(cfg: Config) -> None:
     if not cfg.clean_command:
         _die("No clean.command configured")
+    cmd_clean_locks(cfg)
     _log("Cleaning on all machines...")
     results = _parallel_ssh(
         cfg.machines, cfg.clean_command, cfg.workdir, "clean", timeout=120,
