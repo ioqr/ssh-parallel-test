@@ -261,8 +261,11 @@ def _try_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
              f" || echo BUSY"],
             capture_output=True, text=True, timeout=15,
         )
+        if "LOCKED" not in r.stdout:
+            _log(f"  lock {dest}: rc={r.returncode} stdout={r.stdout.strip()!r} stderr={r.stderr.strip()!r}")
         return "LOCKED" in r.stdout
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _log(f"  lock {dest}: exception={e}")
         return False
 
 
@@ -1119,8 +1122,13 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     run_id = str(_uuid.uuid4())[:8]
     lock_dir = _lock_dir(cfg)
 
-    # Establish ControlMaster connections and drop unreachable machines
-    _check_ssh(cfg)
+    # Quick SSH sanity check - just probe 1 machine to verify agent works
+    _log(f"Checking SSH to {len(cfg.machines)} machine(s)...")
+    test_m = cfg.machines[0]
+    if not ssh_check(test_m.ssh_dest):
+        time.sleep(3)
+        if not ssh_check(test_m.ssh_dest):
+            _die(f"SSH failed to {test_m.host} - check key/agent")
 
     # Discover tests upfront
     _log("Discovering tests...")
@@ -1141,6 +1149,7 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
 
     all_machines = list(cfg.machines)
     locked_hosts: set[str] = set()
+    lock_failures = 0
     all_rsync_results: list[TaskResult] = []
     all_e2e_results: list[TaskResult] = []
     executor = ThreadPoolExecutor(max_workers=min(5, max(1, len(all_machines))))
@@ -1217,15 +1226,10 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
             # If we have pending tests but no machines available, wait
             if any(remaining.values()) and not done:
                 if not running:
-                    # Show who holds the locks
-                    for m in unlocked[:3]:
-                        info = _read_lock_info(m.ssh_dest, lock_dir)
-                        if info:
-                            owner = info.get("host", "?")
-                            ts = float(info.get("ts", 0))
-                            age = int(time.time() - ts)
-                            _log(f"  {m.host}: locked by {owner} ({age}s ago)")
-                    _log(f"All machines busy, waiting {LOCK_POLL_SECS}s...")
+                    lock_failures += 1
+                    if lock_failures > 3:
+                        _die("Could not acquire any machines after 3 attempts")
+                    _log(f"No machines available (attempt {lock_failures}/3), retrying in {LOCK_POLL_SECS}s...")
                 time.sleep(LOCK_POLL_SECS)
 
     except KeyboardInterrupt:
