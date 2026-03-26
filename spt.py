@@ -1449,7 +1449,7 @@ def cmd_status(cfg: Config) -> None:
             docker_ver = "-"
         return m, ssh_ok, docker_ver
 
-    with ThreadPoolExecutor(max_workers=len(cfg.machines)) as pool:
+    with ThreadPoolExecutor(max_workers=min(5, len(cfg.machines))) as pool:
         results = list(pool.map(_check, cfg.machines))
 
     # ANSI color codes add invisible characters that break %-style padding.
