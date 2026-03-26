@@ -1161,9 +1161,24 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
                     prepped, rsync_r = _prep_machines(cfg, newly_locked)
                     all_rsync_results.extend(rsync_r)
 
+                    # Unlock machines that failed prep
+                    prepped_hosts = {m.host for m in prepped}
+                    for m in newly_locked:
+                        if m.host not in prepped_hosts:
+                            _unlock_machine(m.ssh_dest, lock_dir)
+                            locked_hosts.discard(m.host)
+
                     if prepped:
                         # Schedule remaining tests onto new machines
                         assignments = schedule(prepped, remaining, timings)
+                        assigned_hosts = {a.machine.host for a in assignments} if assignments else set()
+
+                        # Unlock prepped machines that got no assignments
+                        for m in prepped:
+                            if m.host not in assigned_hosts:
+                                _unlock_machine(m.ssh_dest, lock_dir)
+                                locked_hosts.discard(m.host)
+
                         if assignments:
                             _log(f"Scheduled {len(assignments)} tasks:")
                             for a in assignments:
