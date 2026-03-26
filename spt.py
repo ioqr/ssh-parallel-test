@@ -970,13 +970,25 @@ def _parallel_ssh(
 def _check_ssh(cfg: Config) -> None:
     """Verify SSH to all machines. Warn and remove unreachable ones."""
     _log("Checking SSH connectivity...")
-    failed = []
-    with ThreadPoolExecutor(max_workers=len(cfg.machines)) as pool:
-        futures = {pool.submit(ssh_check, m.ssh_dest): m for m in cfg.machines}
-        for fut in as_completed(futures):
-            m = futures[fut]
-            if not fut.result():
-                failed.append(m)
+
+    def _probe(machines: list[Machine]) -> list[Machine]:
+        failed = []
+        with ThreadPoolExecutor(max_workers=len(machines)) as pool:
+            futures = {pool.submit(ssh_check, m.ssh_dest): m for m in machines}
+            for fut in as_completed(futures):
+                m = futures[fut]
+                if not fut.result():
+                    failed.append(m)
+        return failed
+
+    failed = _probe(cfg.machines)
+
+    # If all machines failed, retry once after a short delay (SSH agent
+    # can choke when hit with many concurrent connections at startup)
+    if failed and len(failed) == len(cfg.machines):
+        _log("All machines failed, retrying in 3s...")
+        time.sleep(3)
+        failed = _probe(cfg.machines)
 
     if failed:
         hosts = ", ".join(m.host for m in failed)
