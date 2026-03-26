@@ -916,19 +916,18 @@ class TestRemoteLocking:
 
     @mock.patch("spt.subprocess.run")
     def test_check_stale_old(self, mock_run):
-        old_info = json.dumps({"id": "x", "ts": time.time() - spt.LOCK_STALE_SECS - 1})
-        mock_run.return_value = subprocess.CompletedProcess([], 0, old_info, "")
+        old_ts = int(time.time() - spt.LOCK_STALE_SECS - 1)
+        mock_run.return_value = subprocess.CompletedProcess([], 0, f"id=x host=h ts={old_ts}", "")
         assert spt._check_lock_stale("u@10.0.0.1", "/tmp/.spt-lock-test") is True
 
     @mock.patch("spt.subprocess.run")
     def test_check_stale_fresh(self, mock_run):
-        fresh_info = json.dumps({"id": "x", "ts": time.time()})
-        mock_run.return_value = subprocess.CompletedProcess([], 0, fresh_info, "")
+        mock_run.return_value = subprocess.CompletedProcess([], 0, f"id=x host=h ts={int(time.time())}", "")
         assert spt._check_lock_stale("u@10.0.0.1", "/tmp/.spt-lock-test") is False
 
     @mock.patch("spt.subprocess.run")
     def test_check_stale_corrupt(self, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess([], 0, "not json", "")
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "garbage", "")
         assert spt._check_lock_stale("u@10.0.0.1", "/tmp/.spt-lock-test") is True
 
     @mock.patch("spt.subprocess.run")

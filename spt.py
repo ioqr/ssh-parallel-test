@@ -232,12 +232,31 @@ def _lock_dir(cfg: Config) -> str:
     return f"/tmp/.spt-lock-{slug}"
 
 
+def _lock_info(run_id: str) -> str:
+    """Build lock info string, escaped for shell."""
+    # Use simple key=value format to avoid JSON quoting issues in shell
+    host = _socket.gethostname().replace("'", "")
+    ts = int(time.time())
+    return f"id={run_id} host={host} ts={ts}"
+
+
+def _parse_lock_info(raw: str) -> dict:
+    """Parse lock info from key=value format."""
+    info = {}
+    for part in raw.strip().split():
+        if "=" in part:
+            k, v = part.split("=", 1)
+            info[k] = v
+    return info
+
+
 def _try_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
     """Try to atomically lock a remote machine. Returns True if acquired."""
-    info = json.dumps({"id": run_id, "host": _socket.gethostname(), "ts": time.time()})
+    info = _lock_info(run_id)
     r = subprocess.run(
         ["ssh", *_SSH_OPTS, dest,
-         f"mkdir {lock_dir} 2>/dev/null && echo '{info}' > {lock_dir}/info && echo LOCKED"
+         f"mkdir -p $(dirname {lock_dir}) && mkdir {lock_dir} 2>/dev/null"
+         f" && echo '{info}' > {lock_dir}/info && echo LOCKED"
          f" || echo BUSY"],
         capture_output=True, text=True, timeout=15,
     )
@@ -250,17 +269,18 @@ def _check_lock_stale(dest: str, lock_dir: str) -> bool:
         ["ssh", *_SSH_OPTS, dest, f"cat {lock_dir}/info 2>/dev/null"],
         capture_output=True, text=True, timeout=15,
     )
+    info = _parse_lock_info(r.stdout)
     try:
-        info = json.loads(r.stdout)
-        age = time.time() - info.get("ts", 0)
+        ts = float(info.get("ts", "0"))
+        age = time.time() - ts
         return age > LOCK_STALE_SECS
-    except (json.JSONDecodeError, ValueError):
+    except (ValueError, TypeError):
         return True  # corrupt lock, treat as stale
 
 
 def _force_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
     """Force-acquire a lock (for stale lock takeover)."""
-    info = json.dumps({"id": run_id, "host": _socket.gethostname(), "ts": time.time()})
+    info = _lock_info(run_id)
     r = subprocess.run(
         ["ssh", *_SSH_OPTS, dest,
          f"rm -rf {lock_dir} && mkdir {lock_dir} && echo '{info}' > {lock_dir}/info && echo LOCKED"],
