@@ -767,7 +767,7 @@ def _parallel_ssh(
 # ---------------------------------------------------------------------------
 
 def _check_ssh(cfg: Config) -> None:
-    """Verify SSH to all machines. Die with fix-ssh hint if any fail."""
+    """Verify SSH to all machines. Warn and remove unreachable ones."""
     _log("Checking SSH connectivity...")
     failed = []
     with ThreadPoolExecutor(max_workers=len(cfg.machines)) as pool:
@@ -775,13 +775,16 @@ def _check_ssh(cfg: Config) -> None:
         for fut in as_completed(futures):
             m = futures[fut]
             if not fut.result():
-                failed.append(m.host)
+                failed.append(m)
 
     if failed:
-        _die(
-            f"SSH unreachable: {', '.join(failed)}\n"
-            "Run:  spt -c <config> fix-ssh <password>"
-        )
+        hosts = ", ".join(m.host for m in failed)
+        _log(f"{_YELLOW}warning:{_RESET} SSH unreachable: {hosts} (skipping)")
+        for m in failed:
+            cfg.machines.remove(m)
+
+    if not cfg.machines:
+        _die("No reachable machines remaining")
 
 
 def _ensure_docker(cfg: Config) -> None:
