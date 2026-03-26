@@ -1,5 +1,5 @@
 """
-Tests for spt.py — all SSH and subprocess calls are mocked.
+Tests for spt.py - all SSH and subprocess calls are mocked.
 No remote machines are contacted.
 """
 
@@ -878,3 +878,558 @@ class TestTimings:
         spt._save_timings(cfg, {"test1": 10.0, "test2": 20.0})
         loaded = spt._load_timings(cfg)
         assert loaded == {"test1": 10.0, "test2": 20.0}
+
+    def test_save_creates_parent_dirs(self, tmp_path):
+        cfg = spt.Config(
+            machines=[], workdir="", ssh_key=None,
+            rsync_excludes=[], discover_command="", group_regex="",
+            run_command="", duration_regex=None, seed_setup=None,
+            seed_auto=False, docker_install=None, clean_command=None,
+            timings_file=tmp_path / "deep" / "nested" / "timings.json",
+            root=tmp_path,
+        )
+        spt._save_timings(cfg, {"t": 1.0})
+        assert spt._load_timings(cfg) == {"t": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard utilities
+# ---------------------------------------------------------------------------
+
+class TestBar:
+    def test_empty(self):
+        assert spt._bar(0, 5) == "░" * 8
+
+    def test_full(self):
+        assert spt._bar(5, 5) == "█" * 8
+
+    def test_half(self):
+        result = spt._bar(5, 10)
+        assert result.count("█") == 4
+        assert result.count("░") == 4
+
+    def test_zero_total(self):
+        assert spt._bar(0, 0) == "░" * 8
+
+    def test_custom_width(self):
+        assert spt._bar(4, 4, width=4) == "████"
+        assert spt._bar(0, 4, width=4) == "░░░░"
+
+
+class TestShortTest:
+    def test_strips_module_prefix(self):
+        assert spt._short_test("e2e/test_foo.py::test_bar") == "test_bar"
+
+    def test_truncates_long_name(self):
+        long_name = "test_" + "a" * 30
+        result = spt._short_test(f"mod::{long_name}", maxlen=10)
+        assert len(result) == 10
+
+    def test_short_name_unchanged(self):
+        assert spt._short_test("mod::hi") == "hi"
+
+    def test_no_separator(self):
+        assert spt._short_test("standalone_test") == "standalone_test"
+
+
+# ---------------------------------------------------------------------------
+# Schedule: determinism and group correctness
+# ---------------------------------------------------------------------------
+
+class TestScheduleAdvanced:
+    def test_deterministic(self):
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=3),
+            spt.Machine(host="10.0.0.2", user="u", slots=3),
+        ]
+        a1 = spt.schedule(machines, SAMPLE_TESTS, SAMPLE_TIMINGS)
+        a2 = spt.schedule(machines, SAMPLE_TESTS, SAMPLE_TIMINGS)
+        assert len(a1) == len(a2)
+        for x, y in zip(a1, a2):
+            assert x.machine.host == y.machine.host
+            assert x.group == y.group
+            assert x.test_ids == y.test_ids
+
+    def test_group_correctness(self):
+        machines = [
+            spt.Machine(host=f"10.0.0.{i}", user="u", slots=3)
+            for i in range(1, 4)
+        ]
+        assignments = spt.schedule(machines, SAMPLE_TESTS, SAMPLE_TIMINGS)
+        for a in assignments:
+            for t in a.test_ids:
+                assert a.group in t, (
+                    f"Test {t} assigned to group {a.group} but doesn't match"
+                )
+
+    def test_partial_timings(self):
+        # Only some tests have timings; rest should use default
+        partial = {"e2e/test::alpha_0": 100.0, "e2e/test::gamma_0": 200.0}
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=3),
+            spt.Machine(host="10.0.0.2", user="u", slots=3),
+        ]
+        assignments = spt.schedule(machines, SAMPLE_TESTS, partial)
+        all_ids = [t for a in assignments for t in a.test_ids]
+        assert len(all_ids) == 19
+        # The 200s test should influence placement
+        gamma0_host = None
+        for a in assignments:
+            if "e2e/test::gamma_0" in a.test_ids:
+                gamma0_host = a.machine.host
+        assert gamma0_host is not None
+
+    def test_single_test_per_group(self):
+        tests = {"a": ["t::a_0"], "b": ["t::b_0"], "c": ["t::c_0"]}
+        machines = [spt.Machine(host="10.0.0.1", user="u", slots=3)]
+        assignments = spt.schedule(machines, tests)
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 3
+
+    def test_one_huge_group(self):
+        tests = {"big": [f"t::big_{i}" for i in range(50)]}
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=1),
+            spt.Machine(host="10.0.0.2", user="u", slots=1),
+        ]
+        assignments = spt.schedule(machines, tests)
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 50
+        # Both machines should share the load
+        hosts = {a.machine.host for a in assignments}
+        assert len(hosts) == 2
+
+    def test_uneven_groups(self):
+        tests = {
+            "tiny": ["t::tiny_0"],
+            "huge": [f"t::huge_{i}" for i in range(20)],
+        }
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=2),
+            spt.Machine(host="10.0.0.2", user="u", slots=2),
+        ]
+        assignments = spt.schedule(machines, tests)
+        total = sum(len(a.test_ids) for a in assignments)
+        assert total == 21
+
+    def test_more_machines_than_tests(self):
+        tests = {"a": ["t::a_0"]}
+        machines = [
+            spt.Machine(host=f"10.0.0.{i}", user="u", slots=3)
+            for i in range(1, 6)
+        ]
+        assignments = spt.schedule(machines, tests)
+        assert len(assignments) == 1
+        assert assignments[0].test_ids == ["t::a_0"]
+
+
+# ---------------------------------------------------------------------------
+# Estimate wall time: edge cases
+# ---------------------------------------------------------------------------
+
+class TestEstimateWallTimeEdge:
+    def test_empty_tests(self):
+        assert spt._estimate_wall_time(3, {}, {}) == 0.0
+
+    def test_empty_timings_uses_default(self):
+        tests = {"a": ["t1", "t2"]}
+        est = spt._estimate_wall_time(1, tests, {})
+        assert est == 2 * spt.DEFAULT_TEST_DURATION
+
+    def test_single_test(self):
+        tests = {"a": ["t1"]}
+        timings = {"t1": 42.0}
+        est = spt._estimate_wall_time(1, tests, timings)
+        assert est == 42.0
+
+
+# ---------------------------------------------------------------------------
+# Discover tests: edge cases
+# ---------------------------------------------------------------------------
+
+class TestDiscoverEdgeCases:
+    @mock.patch("spt.subprocess.run")
+    def test_skips_lines_without_double_colon(self, mock_run, sample_config):
+        mock_run.return_value = subprocess.CompletedProcess(
+            [], 0,
+            "e2e/test::group1_a\nsome random output\n3 tests collected\n",
+            "",
+        )
+        result = spt.discover_tests(sample_config)
+        total = sum(len(t) for t in result.values())
+        assert total == 1
+
+    @mock.patch("spt.subprocess.run")
+    def test_no_matching_groups(self, mock_run, sample_config):
+        mock_run.return_value = subprocess.CompletedProcess(
+            [], 0, "e2e/test::unrelated_test\n", "",
+        )
+        sample_config.group_regex = "(nonexistent)"
+        result = spt.discover_tests(sample_config)
+        assert result == {}
+
+    @mock.patch("spt.subprocess.run")
+    def test_root_template(self, mock_run, sample_config):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        sample_config.discover_command = "pytest --collect-only -q {root}"
+        spt.discover_tests(sample_config)
+        cmd_arg = mock_run.call_args[0][0]
+        assert str(sample_config.root) in cmd_arg
+
+
+# ---------------------------------------------------------------------------
+# Config loading: more edge cases
+# ---------------------------------------------------------------------------
+
+class TestLoadConfigEdgeCases:
+    def test_project_file_not_found(self, tmp_path):
+        conf = tmp_path / "config.yml"
+        conf.write_text(yaml.dump({
+            "project": "nonexistent.yml",
+            "machines": [{"host": "10.0.0.1"}],
+        }))
+        with pytest.raises(SystemExit):
+            spt.load_config(str(conf))
+
+    def test_seed_auto_true(self, tmp_path):
+        conf = _write_config(tmp_path, {"seed": {"auto": True, "setup": "make build"}})
+        cfg = spt.load_config(str(conf))
+        assert cfg.seed_auto is True
+        assert cfg.seed_setup == "make build"
+
+    def test_seed_auto_false_default(self, tmp_path):
+        conf = _write_config(tmp_path)
+        cfg = spt.load_config(str(conf))
+        assert cfg.seed_auto is False
+
+    def test_clean_command(self, tmp_path):
+        conf = _write_config(tmp_path, {"clean": {"command": "make clean"}})
+        cfg = spt.load_config(str(conf))
+        assert cfg.clean_command == "make clean"
+
+    def test_duration_regex(self, tmp_path):
+        conf = _write_config(tmp_path, {
+            "run": {"command": "pytest {tests}", "duration_regex": r"\s*([\d.]+)s\s+(.+)"},
+        })
+        cfg = spt.load_config(str(conf))
+        assert cfg.duration_regex is not None
+
+    def test_negative_slots(self, tmp_path):
+        conf = tmp_path / "config.yml"
+        conf.write_text(yaml.dump({
+            "machines": [{"host": "10.0.0.1", "slots": -1}],
+            **MINIMAL_PROJECT,
+        }))
+        with pytest.raises(SystemExit):
+            spt.load_config(str(conf))
+
+
+# ---------------------------------------------------------------------------
+# print_summary edge cases
+# ---------------------------------------------------------------------------
+
+class TestPrintSummaryEdge:
+    def test_empty_results(self, capsys):
+        result = spt.RunResult()
+        spt.print_summary(result)
+        out = capsys.readouterr().out
+        assert "0/0" in out
+
+    def test_multiple_failures(self, capsys):
+        result = spt.RunResult(
+            rsync_results=[
+                spt.TaskResult("10.0.0.1", "", 0, True, 1.0),
+                spt.TaskResult("10.0.0.2", "", 0, True, 1.0),
+            ],
+            e2e_results=[
+                spt.TaskResult("10.0.0.1", "alpha", 3, False, 60.0),
+                spt.TaskResult("10.0.0.2", "beta", 2, False, 45.0),
+                spt.TaskResult("10.0.0.1", "gamma", 4, True, 80.0),
+            ],
+            total_duration=85.0,
+            total_tests=9,
+            passed_tests=4,
+        )
+        spt.print_summary(result)
+        out = capsys.readouterr().out
+        assert "FAIL" in out
+        assert "4/9" in out
+        assert "alpha" in out
+        assert "beta" in out
+
+    def test_no_rsync_results(self, capsys):
+        result = spt.RunResult(
+            e2e_results=[spt.TaskResult("10.0.0.1", "alpha", 1, True, 10.0)],
+            total_duration=10.0,
+            total_tests=1,
+            passed_tests=1,
+        )
+        spt.print_summary(result)
+        out = capsys.readouterr().out
+        assert "PASS" in out
+
+
+# ---------------------------------------------------------------------------
+# cmd_seed (mocked)
+# ---------------------------------------------------------------------------
+
+class TestCmdSeed:
+    @mock.patch("spt._parallel_ssh")
+    @mock.patch("spt._parallel_rsync")
+    @mock.patch("spt._ensure_docker")
+    @mock.patch("spt._check_ssh")
+    def test_seed_with_setup(self, mock_check, mock_docker, mock_rsync, mock_ssh, sample_config):
+        sample_config.seed_setup = "make build"
+        mock_rsync.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
+        ]
+        mock_ssh.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 10.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 10.0),
+        ]
+        spt.cmd_seed(sample_config)
+        mock_check.assert_called_once()
+        mock_docker.assert_called_once()
+        mock_rsync.assert_called_once()
+        mock_ssh.assert_called_once()
+
+    @mock.patch("spt._parallel_rsync")
+    @mock.patch("spt._ensure_docker")
+    @mock.patch("spt._check_ssh")
+    def test_seed_no_setup(self, mock_check, mock_docker, mock_rsync, sample_config):
+        sample_config.seed_setup = None
+        mock_rsync.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
+        ]
+        spt.cmd_seed(sample_config)
+        # No _parallel_ssh call when seed_setup is None
+
+    @mock.patch("spt._parallel_rsync")
+    @mock.patch("spt._ensure_docker")
+    @mock.patch("spt._check_ssh")
+    def test_seed_rsync_fail(self, mock_check, mock_docker, mock_rsync, sample_config):
+        sample_config.seed_setup = "make build"
+        mock_rsync.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, False, 1.0, "error"),
+        ]
+        with pytest.raises(SystemExit):
+            spt.cmd_seed(sample_config)
+
+
+# ---------------------------------------------------------------------------
+# cmd_clean (mocked)
+# ---------------------------------------------------------------------------
+
+class TestCmdClean:
+    @mock.patch("spt._parallel_ssh")
+    def test_clean(self, mock_ssh, sample_config):
+        sample_config.clean_command = "make clean"
+        mock_ssh.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 1.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 1.0),
+        ]
+        spt.cmd_clean(sample_config)
+        mock_ssh.assert_called_once()
+        call_args = mock_ssh.call_args[0]
+        assert call_args[1] == "make clean"
+
+    def test_clean_no_command(self, sample_config):
+        sample_config.clean_command = None
+        with pytest.raises(SystemExit):
+            spt.cmd_clean(sample_config)
+
+    @mock.patch("spt._parallel_ssh")
+    def test_clean_partial_failure(self, mock_ssh, sample_config):
+        sample_config.clean_command = "make clean"
+        mock_ssh.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 1.0),
+            spt.TaskResult("10.0.0.2", "", 0, False, 1.0, "failed"),
+        ]
+        # Clean does not die on partial failure, just warns
+        spt.cmd_clean(sample_config)
+
+
+# ---------------------------------------------------------------------------
+# cmd_run with auto-seed
+# ---------------------------------------------------------------------------
+
+class TestCmdRunAutoSeed:
+    @mock.patch("spt._save_timings")
+    @mock.patch("spt._load_timings", return_value={})
+    @mock.patch("spt._check_ssh")
+    @mock.patch("spt._parallel_e2e", return_value=[])
+    @mock.patch("spt.discover_tests", return_value={"a": ["t1"]})
+    @mock.patch("spt._parallel_ssh")
+    @mock.patch("spt._ensure_docker")
+    @mock.patch("spt._parallel_rsync")
+    def test_auto_seed_runs_setup(
+        self, mock_rsync, mock_docker, mock_seed_ssh,
+        mock_discover, mock_e2e, mock_ssh, mock_load_t, mock_save_t,
+        sample_config,
+    ):
+        sample_config.seed_auto = True
+        sample_config.seed_setup = "make build"
+        mock_rsync.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
+        ]
+        mock_seed_ssh.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 5.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 5.0),
+        ]
+        mock_e2e.return_value = [
+            spt.TaskResult("10.0.0.1", "a", 1, True, 10.0),
+        ]
+        spt.cmd_run(sample_config)
+        mock_docker.assert_called_once()
+        mock_seed_ssh.assert_called_once()
+
+    @mock.patch("spt._save_timings")
+    @mock.patch("spt._load_timings", return_value={})
+    @mock.patch("spt._check_ssh")
+    @mock.patch("spt._parallel_e2e", return_value=[])
+    @mock.patch("spt.discover_tests", return_value={"a": ["t1"]})
+    @mock.patch("spt._parallel_rsync")
+    def test_no_auto_seed_skips_setup(
+        self, mock_rsync, mock_discover, mock_e2e, mock_ssh,
+        mock_load_t, mock_save_t, sample_config,
+    ):
+        sample_config.seed_auto = False
+        sample_config.seed_setup = "make build"
+        mock_rsync.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
+            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
+        ]
+        mock_e2e.return_value = [
+            spt.TaskResult("10.0.0.1", "a", 1, True, 10.0),
+        ]
+        spt.cmd_run(sample_config)
+        # _parallel_ssh for seed should NOT have been called
+
+
+# ---------------------------------------------------------------------------
+# _parallel_ssh (mocked)
+# ---------------------------------------------------------------------------
+
+class TestParallelSSH:
+    @mock.patch("spt.ssh_run")
+    def test_all_succeed(self, mock_ssh):
+        mock_ssh.return_value = subprocess.CompletedProcess([], 0, "ok", "")
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=3),
+            spt.Machine(host="10.0.0.2", user="u", slots=3),
+        ]
+        results = spt._parallel_ssh(machines, "make build", "/root/proj", "setup")
+        assert len(results) == 2
+        assert all(r.ok for r in results)
+
+    @mock.patch("spt.ssh_run")
+    def test_one_timeout(self, mock_ssh):
+        def side_effect(dest, command, workdir=None, timeout=600):
+            if "10.0.0.2" in dest:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return subprocess.CompletedProcess([], 0, "ok", "")
+
+        mock_ssh.side_effect = side_effect
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=3),
+            spt.Machine(host="10.0.0.2", user="u", slots=3),
+        ]
+        results = spt._parallel_ssh(machines, "make build", "/root/proj", "setup")
+        ok = [r for r in results if r.ok]
+        fail = [r for r in results if not r.ok]
+        assert len(ok) == 1
+        assert len(fail) == 1
+
+    @mock.patch("spt.ssh_run")
+    def test_sorted_by_host(self, mock_ssh):
+        mock_ssh.return_value = subprocess.CompletedProcess([], 0, "ok", "")
+        machines = [
+            spt.Machine(host="10.0.0.3", user="u", slots=1),
+            spt.Machine(host="10.0.0.1", user="u", slots=1),
+            spt.Machine(host="10.0.0.2", user="u", slots=1),
+        ]
+        results = spt._parallel_ssh(machines, "echo", "/tmp", "test")
+        hosts = [r.host for r in results]
+        assert hosts == sorted(hosts)
+
+
+# ---------------------------------------------------------------------------
+# rsync_to: verifies mkdir precondition
+# ---------------------------------------------------------------------------
+
+class TestRsyncTo:
+    @mock.patch("spt.subprocess.run")
+    def test_creates_workdir_first(self, mock_run, sample_config):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        spt.rsync_to(sample_config, "u@10.0.0.1", "/opt/project")
+        # First call should be the mkdir SSH call
+        first_call = mock_run.call_args_list[0]
+        cmd = first_call[0][0]
+        assert "ssh" in cmd[0]
+        assert "mkdir -p" in " ".join(cmd)
+        # Second call should be rsync
+        second_call = mock_run.call_args_list[1]
+        cmd2 = second_call[0][0]
+        assert cmd2[0] == "rsync"
+
+    @mock.patch("spt.subprocess.run")
+    def test_rsync_excludes(self, mock_run, sample_config):
+        sample_config.rsync_excludes = [".git/", "__pycache__/", "node_modules/"]
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        spt.rsync_to(sample_config, "u@10.0.0.1", "/opt/project")
+        rsync_call = mock_run.call_args_list[1]
+        cmd = rsync_call[0][0]
+        excludes = [cmd[i + 1] for i, v in enumerate(cmd) if v == "--exclude"]
+        assert ".git/" in excludes
+        assert "__pycache__/" in excludes
+        assert "node_modules/" in excludes
+
+
+# ---------------------------------------------------------------------------
+# _parse_durations: more patterns
+# ---------------------------------------------------------------------------
+
+class TestParseDurationsEdge:
+    def test_multiple_formats(self):
+        output = "  123.45s call     e2e/test.py::test_a\n  0.5s call     e2e/test.py::test_b\n"
+        regex = r"\s*([\d.]+)s call\s+(.+)"
+        result = spt._parse_durations(output, regex)
+        assert result["e2e/test.py::test_a"] == 123.45
+        assert result["e2e/test.py::test_b"] == 0.5
+
+    def test_ignores_non_matching_lines(self):
+        output = "PASSED\nFAILED\n  10.0s call  e2e/test.py::test_x\ngarbage\n"
+        regex = r"\s*([\d.]+)s call\s+(.+)"
+        result = spt._parse_durations(output, regex)
+        assert len(result) == 1
+        assert result["e2e/test.py::test_x"] == 10.0
+
+    def test_last_value_wins_on_duplicate(self):
+        output = "  5.0s call  t::a\n  10.0s call  t::a\n"
+        regex = r"\s*([\d.]+)s call\s+(.+)"
+        result = spt._parse_durations(output, regex)
+        assert result["t::a"] == 10.0
+
+
+# ---------------------------------------------------------------------------
+# Deep merge: more cases
+# ---------------------------------------------------------------------------
+
+class TestDeepMergeEdge:
+    def test_empty_base(self):
+        assert spt._deep_merge({}, {"a": 1}) == {"a": 1}
+
+    def test_empty_overlay(self):
+        assert spt._deep_merge({"a": 1}, {}) == {"a": 1}
+
+    def test_both_empty(self):
+        assert spt._deep_merge({}, {}) == {}
+
+    def test_deeply_nested(self):
+        base = {"a": {"b": {"c": 1, "d": 2}}}
+        overlay = {"a": {"b": {"d": 3, "e": 4}}}
+        result = spt._deep_merge(base, overlay)
+        assert result == {"a": {"b": {"c": 1, "d": 3, "e": 4}}}
