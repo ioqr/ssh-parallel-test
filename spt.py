@@ -1081,7 +1081,7 @@ def _prep_machines(cfg: Config, machines: list[Machine]) -> list[Machine]:
     return ok, rsync_results
 
 
-def cmd_run(cfg: Config) -> RunResult:
+def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     t0 = time.monotonic()
     run_id = str(_uuid.uuid4())[:8]
     lock_dir = _lock_dir(cfg)
@@ -1091,6 +1091,10 @@ def cmd_run(cfg: Config) -> RunResult:
     # Discover tests upfront
     _log("Discovering tests...")
     tests_by_group = discover_tests(cfg)
+    if group_filter:
+        tests_by_group = {g: t for g, t in tests_by_group.items() if g == group_filter}
+        if not tests_by_group:
+            _die(f"No tests found for group '{group_filter}'")
     total_tests = sum(len(t) for t in tests_by_group.values())
     _log(f"Found {total_tests} tests across {len(tests_by_group)} groups")
 
@@ -1436,7 +1440,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("seed", help="rsync + setup machines")
-    sub.add_parser("run", help="rsync + discover + distribute + run tests")
+    run_p = sub.add_parser("run", help="rsync + discover + distribute + run tests")
+    run_p.add_argument("-g", "--group", help="Only run tests for this group (e.g. janus)")
     sub.add_parser("clean", help="Run cleanup on remotes")
     sub.add_parser("clean-locks", help="Remove all remote locks")
 
@@ -1464,7 +1469,7 @@ def main() -> None:
         case "seed":
             cmd_seed(cfg)
         case "run":
-            result = cmd_run(cfg)
+            result = cmd_run(cfg, group_filter=getattr(args, "group", None))
             if any(not r.ok for r in result.e2e_results):
                 sys.exit(1)
         case "clean":
