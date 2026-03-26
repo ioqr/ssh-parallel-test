@@ -828,13 +828,15 @@ def _parallel_e2e(
 
 def _parallel_ssh(
     machines: list[Machine], command: str, workdir: str,
-    label: str, timeout: int = 600,
+    label: str, timeout: int = 600, progress_interval: int = 0,
 ) -> list[TaskResult]:
     results: list[TaskResult] = []
+    start_times: dict[str, float] = {}
 
     def _do(m: Machine) -> TaskResult:
         _log(f"{label}  {m.ssh_dest}")
         t0 = time.monotonic()
+        start_times[m.host] = t0
         try:
             r = ssh_run(m.ssh_dest, command, workdir=workdir, timeout=timeout)
             ok = r.returncode == 0
@@ -848,6 +850,25 @@ def _parallel_ssh(
 
     with ThreadPoolExecutor(max_workers=len(machines)) as pool:
         futures = {pool.submit(_do, m): m for m in machines}
+
+        if progress_interval and len(machines) > 1:
+            while not all(f.done() for f in futures):
+                time.sleep(progress_interval)
+                if all(f.done() for f in futures):
+                    break
+                now = time.monotonic()
+                done = sum(1 for f in futures if f.done())
+                still = [
+                    futures[f] for f in futures if not f.done()
+                ]
+                longest = max(still, key=lambda m: now - start_times.get(m.host, now))
+                longest_dur = now - start_times.get(longest.host, now)
+                _log(
+                    f"{label}  {done}/{len(futures)} done, "
+                    f"{len(still)} running "
+                    f"(longest: {longest.host} {_fmt_duration(longest_dur)})"
+                )
+
         for fut in as_completed(futures):
             results.append(fut.result())
 
@@ -900,6 +921,7 @@ def _ensure_docker(cfg: Config) -> None:
     _log(f"Installing Docker on: {hosts}")
     install_results = _parallel_ssh(
         need_docker, cfg.docker_install, workdir=None, label="docker", timeout=300,
+        progress_interval=30,
     )
     for r in install_results:
         if not r.ok:
@@ -935,7 +957,7 @@ def cmd_seed(cfg: Config) -> None:
         _log("Running setup on all machines...")
         setup_results = _parallel_ssh(
             cfg.machines, cfg.seed_setup,
-            cfg.workdir, "setup", timeout=1800,
+            cfg.workdir, "setup", timeout=1800, progress_interval=30,
         )
         for sr in setup_results:
             if not sr.ok:
@@ -964,7 +986,7 @@ def _prep_machines(cfg: Config, machines: list[Machine]) -> list[Machine]:
         _ensure_docker(cfg)
     if cfg.seed_auto and cfg.seed_setup:
         _log(f"Auto-seeding {len(ok)} machine(s)...")
-        setup_results = _parallel_ssh(ok, cfg.seed_setup, cfg.workdir, "seed", timeout=1800)
+        setup_results = _parallel_ssh(ok, cfg.seed_setup, cfg.workdir, "seed", timeout=1800, progress_interval=30)
         failed = [sr for sr in setup_results if not sr.ok]
         for sr in failed:
             print(f"\n--- seed output ({sr.host}) ---\n{sr.output}---\n", file=sys.stderr)
