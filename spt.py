@@ -1118,13 +1118,17 @@ def cmd_status(cfg: Config) -> None:
     with ThreadPoolExecutor(max_workers=len(cfg.machines)) as pool:
         results = list(pool.map(_check, cfg.machines))
 
+    # ANSI color codes add invisible characters that break %-style padding.
+    # Use fixed-width labels so columns line up regardless of color.
+    ansi_pad = len(_GREEN) + len(_RESET) if _GREEN else 0
+
     print()
     print(f"  {'host':<17} {'user':<15} {'slots':>5}  {'ssh':<6} {'docker':<12}")
     print(f"  {'─' * 17} {'─' * 15} {'─' * 5}  {'─' * 6} {'─' * 12}")
     for m, ssh_ok, docker_ver in results:
         print(
             f"  {m.host:<17} {m.user:<15} {m.slots:>5}  "
-            f"{ssh_ok:<15} {docker_ver}"
+            f"{ssh_ok:<{6 + ansi_pad}} {docker_ver}"
         )
     print()
 
