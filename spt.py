@@ -968,12 +968,13 @@ def _parallel_ssh(
 # ---------------------------------------------------------------------------
 
 def _check_ssh(cfg: Config) -> None:
-    """Verify SSH to all machines. Warn and remove unreachable ones."""
-    _log("Checking SSH connectivity...")
+    """Verify SSH to all machines and establish ControlMaster connections."""
+    _log(f"Connecting to {len(cfg.machines)} machine(s)...")
 
     def _probe(machines: list[Machine]) -> list[Machine]:
         failed = []
-        with ThreadPoolExecutor(max_workers=len(machines)) as pool:
+        # Limit parallelism to avoid overwhelming the SSH agent
+        with ThreadPoolExecutor(max_workers=min(5, len(machines))) as pool:
             futures = {pool.submit(ssh_check, m.ssh_dest): m for m in machines}
             for fut in as_completed(futures):
                 m = futures[fut]
