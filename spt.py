@@ -1051,11 +1051,15 @@ def cmd_seed(cfg: Config) -> None:
 
     _log("Syncing repo to all machines...")
     rsync_results = _parallel_rsync(cfg)
-    if any(not r.ok for r in rsync_results):
-        for r in rsync_results:
-            if not r.ok:
-                print(f"  rsync to {r.host} failed: {r.output}", file=sys.stderr)
-        _die("rsync failed")
+    failed_hosts = set()
+    for r in rsync_results:
+        if not r.ok:
+            _log(f"{_YELLOW}warning:{_RESET} rsync to {r.host} failed, skipping")
+            failed_hosts.add(r.host)
+    if failed_hosts:
+        cfg.machines = [m for m in cfg.machines if m.host not in failed_hosts]
+    if not cfg.machines:
+        _die("rsync failed on all machines")
 
     if cfg.seed_setup:
         _log("Running setup on all machines...")
