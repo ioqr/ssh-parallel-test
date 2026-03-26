@@ -369,6 +369,7 @@ def _setup_ssh(cfg: Config) -> None:
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
         "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
     ]
     if cfg.ssh_key:
         opts += ["-o", "IdentitiesOnly=yes", "-i", str(cfg.ssh_key)]

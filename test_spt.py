@@ -549,6 +549,17 @@ class TestSetupSSH:
         assert "-i" not in spt._SSH_OPTS
         assert "IdentitiesOnly" not in " ".join(spt._SSH_OPTS)
 
+    def test_batch_mode_always_set(self, tmp_path):
+        cfg = spt.Config(
+            machines=[], workdir="", ssh_key=None,
+            rsync_excludes=[], discover_command="", group_regex="",
+            run_command="", duration_regex=None, seed_setup=None,
+            seed_auto=False, docker_install=None, clean_command=None,
+            timings_file=tmp_path / "t.json", root=tmp_path,
+        )
+        spt._setup_ssh(cfg)
+        assert "BatchMode=yes" in " ".join(spt._SSH_OPTS)
+
 
 # ---------------------------------------------------------------------------
 # Result tracking / summary
