@@ -354,10 +354,12 @@ def _try_lock_machines(
             _log(f"{_YELLOW}warning:{_RESET} lock check failed for {m.host}: {e}")
             return None
 
-    for m in machines:
-        result = _try(m)
-        if result is not None:
-            locked.append(result)
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(machines)))) as pool:
+        futs = {pool.submit(_try, m): m for m in machines}
+        for fut in as_completed(futs):
+            result = fut.result()
+            if result is not None:
+                locked.append(result)
 
     return locked
 
@@ -534,18 +536,29 @@ _SSH_OPTS: list[str] = []
 
 def _setup_ssh(cfg: Config) -> None:
     global _SSH_OPTS
+    # ControlMaster sockets need a tmpfs (Unix sockets fail on macOS
+    # volume mounts). Try /run first (container tmpfs), fall back to home.
+    for ctrl_dir in ("/run/spt-ssh", os.path.expanduser("~/.spt-ssh")):
+        try:
+            os.makedirs(ctrl_dir, exist_ok=True)
+            break
+        except PermissionError:
+            continue
     opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
+        "-o", f"ControlPath={ctrl_dir}/%r@%h:%p",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=300",
     ]
     if cfg.ssh_key:
         if not cfg.ssh_key.exists():
             _log(f"{_RED}error:{_RESET} ssh key not found: {cfg.ssh_key}")
             raise SystemExit(1)
-        opts += ["-i", str(cfg.ssh_key)]
+        opts += ["-o", "IdentitiesOnly=yes", "-i", str(cfg.ssh_key)]
     _SSH_OPTS = opts
 
 
@@ -1117,26 +1130,8 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     run_id = str(_uuid.uuid4())[:8]
     lock_dir = _lock_dir(cfg)
 
-    # Verify SSH connectivity and drop unreachable machines
-    _log(f"Checking SSH to {len(cfg.machines)} machine(s)...")
-    failed = []
-    for m in cfg.machines:
-        try:
-            r = subprocess.run(
-                ["ssh", *_SSH_OPTS, "-o", "ConnectTimeout=3", m.ssh_dest, "true"],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode != 0:
-                failed.append(m)
-        except (subprocess.TimeoutExpired, OSError):
-            failed.append(m)
-    if failed:
-        hosts = ", ".join(m.host for m in failed)
-        _log(f"{_YELLOW}warning:{_RESET} SSH unreachable: {hosts} (skipping)")
-        for m in failed:
-            cfg.machines.remove(m)
-    if not cfg.machines:
-        _die("No reachable machines")
+    # Establish ControlMaster connections and drop unreachable machines
+    _check_ssh(cfg)
 
     # Discover tests upfront
     _log("Discovering tests...")
