@@ -536,23 +536,12 @@ _SSH_OPTS: list[str] = []
 
 def _setup_ssh(cfg: Config) -> None:
     global _SSH_OPTS
-    # Control sockets need a tmpfs (Unix sockets fail on macOS volume
-    # mounts). Try /run first (container tmpfs), fall back to ~/.spt-ssh.
-    for ctrl_dir in ("/run/spt-ssh", os.path.expanduser("~/.spt-ssh")):
-        try:
-            os.makedirs(ctrl_dir, exist_ok=True)
-            break
-        except PermissionError:
-            continue
     opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
         "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
-        "-o", f"ControlPath={ctrl_dir}/%r@%h:%p",
-        "-o", "ControlMaster=auto",
-        "-o", "ControlPersist=300",
     ]
     if cfg.ssh_key:
         opts += ["-o", "IdentitiesOnly=yes", "-i", str(cfg.ssh_key)]
@@ -573,10 +562,7 @@ def ssh_check(dest: str) -> bool:
     try:
         r = subprocess.run(
             ["ssh", *_SSH_OPTS, dest, "true"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
+            capture_output=True, timeout=10,
         )
         return r.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
