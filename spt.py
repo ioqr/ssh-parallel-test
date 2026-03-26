@@ -357,12 +357,10 @@ def _try_lock_machines(
             _log(f"{_YELLOW}warning:{_RESET} lock check failed for {m.host}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=min(5, max(1, len(machines)))) as pool:
-        futs = {pool.submit(_try, m): m for m in machines}
-        for fut in as_completed(futs):
-            result = fut.result()
-            if result is not None:
-                locked.append(result)
+    for m in machines:
+        result = _try(m)
+        if result is not None:
+            locked.append(result)
 
     return locked
 
