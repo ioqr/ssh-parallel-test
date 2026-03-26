@@ -253,14 +253,11 @@ def _parse_lock_info(raw: str) -> dict:
 def _try_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
     """Try to atomically lock a remote machine. Returns True if acquired."""
     info = _lock_info(run_id)
+    cmd = (f"mkdir -p $(dirname {lock_dir}) && mkdir {lock_dir} 2>/dev/null"
+           f" && echo '{info}' > {lock_dir}/info && echo LOCKED"
+           f" || echo BUSY")
     try:
-        r = subprocess.run(
-            ["ssh", *_SSH_OPTS, dest,
-             f"mkdir -p $(dirname {lock_dir}) && mkdir {lock_dir} 2>/dev/null"
-             f" && echo '{info}' > {lock_dir}/info && echo LOCKED"
-             f" || echo BUSY"],
-            capture_output=True, text=True, timeout=15,
-        )
+        r = ssh_run(dest, cmd, timeout=15)
         if "LOCKED" not in r.stdout:
             _log(f"  lock {dest}: rc={r.returncode} stdout={r.stdout.strip()!r} stderr={r.stderr.strip()!r}")
         return "LOCKED" in r.stdout
@@ -548,7 +545,7 @@ def _setup_ssh(cfg: Config) -> None:
         if not cfg.ssh_key.exists():
             _log(f"{_RED}error:{_RESET} ssh key not found: {cfg.ssh_key}")
             raise SystemExit(1)
-        opts += ["-o", "IdentitiesOnly=yes", "-i", str(cfg.ssh_key)]
+        opts += ["-i", str(cfg.ssh_key)]
     _SSH_OPTS = opts
 
 
@@ -1120,13 +1117,20 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     run_id = str(_uuid.uuid4())[:8]
     lock_dir = _lock_dir(cfg)
 
-    # Quick SSH sanity check - just probe 1 machine to verify agent works
+    # Verify SSH connectivity and drop unreachable machines
     _log(f"Checking SSH to {len(cfg.machines)} machine(s)...")
-    test_m = cfg.machines[0]
-    if not ssh_check(test_m.ssh_dest):
-        time.sleep(3)
-        if not ssh_check(test_m.ssh_dest):
-            _die(f"SSH failed to {test_m.host} - check key/agent")
+    failed = []
+    for m in cfg.machines:
+        r = ssh_run(m.ssh_dest, "true", timeout=10)
+        if r.returncode != 0:
+            failed.append(m)
+    if failed:
+        hosts = ", ".join(m.host for m in failed)
+        _log(f"{_YELLOW}warning:{_RESET} SSH unreachable: {hosts} (skipping)")
+        for m in failed:
+            cfg.machines.remove(m)
+    if not cfg.machines:
+        _die("No reachable machines")
 
     # Discover tests upfront
     _log("Discovering tests...")
