@@ -1083,8 +1083,6 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     run_id = str(_uuid.uuid4())[:8]
     lock_dir = _lock_dir(cfg)
 
-    _check_ssh(cfg)
-
     # Discover tests upfront
     _log("Discovering tests...")
     tests_by_group = discover_tests(cfg)
