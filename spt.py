@@ -354,7 +354,7 @@ def _try_lock_machines(
             _log(f"{_YELLOW}warning:{_RESET} lock check failed for {m.host}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=max(1, len(machines))) as pool:
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(machines)))) as pool:
         futs = {pool.submit(_try, m): m for m in machines}
         for fut in as_completed(futs):
             result = fut.result()
@@ -366,7 +366,7 @@ def _try_lock_machines(
 
 def _unlock_machines(machines: list[Machine], lock_dir: str) -> None:
     """Release locks on multiple machines in parallel."""
-    with ThreadPoolExecutor(max_workers=max(1, len(machines))) as pool:
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(machines)))) as pool:
         list(pool.map(lambda m: _unlock_machine(m.ssh_dest, lock_dir), machines))
 
 
@@ -382,7 +382,7 @@ def cmd_clean_locks(cfg: Config) -> None:
             return f"  {m.host}: removed (was: {info.get('id', '?')} by {info.get('host', '?')})"
         return f"  {m.host}: clean"
 
-    with ThreadPoolExecutor(max_workers=max(1, len(cfg.machines))) as pool:
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(cfg.machines)))) as pool:
         for msg in pool.map(_clean, cfg.machines):
             print(msg)
 
@@ -1088,7 +1088,7 @@ def _prep_machines(cfg: Config, machines: list[Machine]) -> list[Machine]:
             needs = bool(r.stdout.strip()) or r.returncode != 0
             return m, needs
 
-        with ThreadPoolExecutor(max_workers=max(1, len(ok))) as pool:
+        with ThreadPoolExecutor(max_workers=min(5, max(1, len(ok)))) as pool:
             for m, needs in pool.map(_check_seed, ok):
                 if needs:
                     need_seed.append(m)
@@ -1143,7 +1143,7 @@ def cmd_run(cfg: Config, group_filter: str = None) -> RunResult:
     locked_hosts: set[str] = set()
     all_rsync_results: list[TaskResult] = []
     all_e2e_results: list[TaskResult] = []
-    executor = ThreadPoolExecutor(max_workers=max(1, len(all_machines)))
+    executor = ThreadPoolExecutor(max_workers=min(5, max(1, len(all_machines))))
     running: dict = {}  # future -> TestAssignment
 
     try:
