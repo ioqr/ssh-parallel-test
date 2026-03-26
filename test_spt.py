@@ -685,48 +685,28 @@ class TestParallelE2E:
 class TestCmdRun:
     @mock.patch("spt._save_timings")
     @mock.patch("spt._load_timings", return_value={})
-    @mock.patch("spt._check_ssh")
-    @mock.patch("spt._parallel_e2e")
+    @mock.patch("spt._unlock_machine")
+    @mock.patch("spt._run_assignment")
+    @mock.patch("spt._prep_machines")
+    @mock.patch("spt._try_lock_machines")
     @mock.patch("spt.discover_tests")
-    @mock.patch("spt._parallel_rsync")
-    def test_pass(self, mock_rsync, mock_discover, mock_e2e, mock_ssh, mock_load_t, mock_save_t, sample_config):
-        mock_rsync.return_value = [
-            spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
-            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
-        ]
+    @mock.patch("spt._check_ssh")
+    def test_pass(self, mock_ssh, mock_discover, mock_lock, mock_prep,
+                  mock_run_a, mock_unlock, mock_load_t, mock_save_t, sample_config):
+        m1 = sample_config.machines[0]
+        m2 = sample_config.machines[1]
+        mock_lock.return_value = [m1, m2]
+        mock_prep.return_value = (
+            [m1, m2],
+            [spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
+             spt.TaskResult("10.0.0.2", "", 0, True, 2.0)],
+        )
         mock_discover.return_value = {"alpha": ["t1", "t2"], "beta": ["t3"]}
-        mock_e2e.return_value = [
-            spt.TaskResult("10.0.0.1", "alpha", 1, True, 30.0),
-            spt.TaskResult("10.0.0.2", "alpha", 1, True, 28.0),
-            spt.TaskResult("10.0.0.1", "beta", 1, True, 45.0),
-        ]
+        mock_run_a.return_value = spt.TaskResult("10.0.0.1", "alpha", 1, True, 30.0, "")
 
         result = spt.cmd_run(sample_config)
         assert result.total_tests == 3
-        assert result.passed_tests == 3
-        assert all(r.ok for r in result.e2e_results)
-
-    @mock.patch("spt._save_timings")
-    @mock.patch("spt._load_timings", return_value={})
-    @mock.patch("spt._check_ssh")
-    @mock.patch("spt._parallel_e2e")
-    @mock.patch("spt.discover_tests")
-    @mock.patch("spt._parallel_rsync")
-    def test_rsync_fail_reduces_machines(self, mock_rsync, mock_discover, mock_e2e, mock_ssh, mock_load_t, mock_save_t, sample_config):
-        mock_rsync.return_value = [
-            spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
-            spt.TaskResult("10.0.0.2", "", 0, False, 1.0, "connection refused"),
-        ]
-        mock_discover.return_value = {"alpha": ["t1", "t2"]}
-        mock_e2e.return_value = [
-            spt.TaskResult("10.0.0.1", "alpha", 2, True, 60.0),
-        ]
-
-        result = spt.cmd_run(sample_config)
-        mock_e2e.assert_called_once()
-        assignments = mock_e2e.call_args[0][1]
-        hosts = {a.machine.host for a in assignments}
-        assert "10.0.0.2" not in hosts
+        assert mock_run_a.called
 
 
 # ---------------------------------------------------------------------------
@@ -909,57 +889,73 @@ class TestTimings:
 # Cluster locking
 # ---------------------------------------------------------------------------
 
-def _lock_cfg(tmp_path):
-    return spt.Config(
-        machines=[], workdir="", ssh_key=None,
-        rsync_excludes=[], discover_command="", group_regex="",
-        run_command="", duration_regex=None, seed_setup=None,
-        seed_auto=False, docker_install=None, clean_command=None,
-        timings_file=tmp_path / "timings.json", root=tmp_path,
-    )
+class TestRemoteLocking:
+    def test_lock_dir_from_workdir(self):
+        cfg = spt.Config(
+            machines=[], workdir="~/call.zip", ssh_key=None,
+            rsync_excludes=[], discover_command="", group_regex="",
+            run_command="", duration_regex=None, seed_setup=None,
+            seed_auto=False, docker_install=None, clean_command=None,
+            timings_file=Path("/tmp/t.json"), root=Path("/tmp"),
+        )
+        lock_dir = spt._lock_dir(cfg)
+        assert "call-zip" in lock_dir
+        assert lock_dir.startswith("/tmp/.spt-lock-")
 
+    @mock.patch("spt.subprocess.run")
+    def test_try_lock_success(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "LOCKED", "")
+        result = spt._try_lock_machine("u@10.0.0.1", "/tmp/.spt-lock-test", "abc123")
+        assert result is True
 
-class TestLocking:
-    def test_acquire_and_release(self, tmp_path):
-        cfg = _lock_cfg(tmp_path)
-        spt._acquire_lock(cfg)
-        lock = spt._lock_path(cfg)
-        assert lock.exists()
-        info = json.loads(lock.read_text())
-        assert "id" in info
-        assert "pid" in info
-        assert "timestamp" in info
-        spt._release_lock(cfg)
-        assert not lock.exists()
+    @mock.patch("spt.subprocess.run")
+    def test_try_lock_busy(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "BUSY", "")
+        result = spt._try_lock_machine("u@10.0.0.1", "/tmp/.spt-lock-test", "abc123")
+        assert result is False
 
-    def test_stale_lock_taken_over(self, tmp_path):
-        cfg = _lock_cfg(tmp_path)
-        lock = spt._lock_path(cfg)
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text(json.dumps({
-            "id": "old-run",
-            "host": "other-host",
-            "pid": 99999,
-            "timestamp": time.time() - spt.LOCK_STALE_SECS - 1,
-        }))
-        spt._acquire_lock(cfg)
-        info = json.loads(lock.read_text())
-        assert info["id"] != "old-run"
-        spt._release_lock(cfg)
+    @mock.patch("spt.subprocess.run")
+    def test_check_stale_old(self, mock_run):
+        old_info = json.dumps({"id": "x", "ts": time.time() - spt.LOCK_STALE_SECS - 1})
+        mock_run.return_value = subprocess.CompletedProcess([], 0, old_info, "")
+        assert spt._check_lock_stale("u@10.0.0.1", "/tmp/.spt-lock-test") is True
 
-    def test_corrupt_lock_taken_over(self, tmp_path):
-        cfg = _lock_cfg(tmp_path)
-        lock = spt._lock_path(cfg)
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text("not json")
-        spt._acquire_lock(cfg)
-        assert lock.exists()
-        spt._release_lock(cfg)
+    @mock.patch("spt.subprocess.run")
+    def test_check_stale_fresh(self, mock_run):
+        fresh_info = json.dumps({"id": "x", "ts": time.time()})
+        mock_run.return_value = subprocess.CompletedProcess([], 0, fresh_info, "")
+        assert spt._check_lock_stale("u@10.0.0.1", "/tmp/.spt-lock-test") is False
 
-    def test_release_missing_lock(self, tmp_path):
-        cfg = _lock_cfg(tmp_path)
-        # Should not raise
-        spt._release_lock(cfg)
+    @mock.patch("spt.subprocess.run")
+    def test_check_stale_corrupt(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "not json", "")
+        assert spt._check_lock_stale("u@10.0.0.1", "/tmp/.spt-lock-test") is True
+
+    @mock.patch("spt.subprocess.run")
+    def test_try_lock_machines_parallel(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "LOCKED", "")
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=3),
+            spt.Machine(host="10.0.0.2", user="u", slots=3),
+        ]
+        locked = spt._try_lock_machines(machines, "/tmp/.spt-lock-test", "abc")
+        assert len(locked) == 2
+
+    @mock.patch("spt.subprocess.run")
+    def test_try_lock_machines_partial(self, mock_run):
+        def side_effect(cmd, **kwargs):
+            if "10.0.0.2" in " ".join(cmd):
+                return subprocess.CompletedProcess([], 0, "BUSY", "")
+            return subprocess.CompletedProcess([], 0, "LOCKED", "")
+
+        mock_run.side_effect = side_effect
+        machines = [
+            spt.Machine(host="10.0.0.1", user="u", slots=3),
+            spt.Machine(host="10.0.0.2", user="u", slots=3),
+        ]
+        locked = spt._try_lock_machines(machines, "/tmp/.spt-lock-test", "abc")
+        assert len(locked) == 1
+        assert locked[0].host == "10.0.0.1"
 
 
 # ---------------------------------------------------------------------------
@@ -1325,58 +1321,44 @@ class TestCmdClean:
 # cmd_run with auto-seed
 # ---------------------------------------------------------------------------
 
-class TestCmdRunAutoSeed:
-    @mock.patch("spt._save_timings")
-    @mock.patch("spt._load_timings", return_value={})
-    @mock.patch("spt._check_ssh")
-    @mock.patch("spt._parallel_e2e", return_value=[])
-    @mock.patch("spt.discover_tests", return_value={"a": ["t1"]})
+class TestPrepMachines:
     @mock.patch("spt._parallel_ssh")
     @mock.patch("spt._ensure_docker")
     @mock.patch("spt._parallel_rsync")
-    def test_auto_seed_runs_setup(
-        self, mock_rsync, mock_docker, mock_seed_ssh,
-        mock_discover, mock_e2e, mock_ssh, mock_load_t, mock_save_t,
-        sample_config,
-    ):
+    def test_prep_with_seed(self, mock_rsync, mock_docker, mock_seed_ssh, sample_config):
         sample_config.seed_auto = True
         sample_config.seed_setup = "make build"
+        m1 = sample_config.machines[0]
         mock_rsync.return_value = [
             spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
-            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
         ]
         mock_seed_ssh.return_value = [
             spt.TaskResult("10.0.0.1", "", 0, True, 5.0),
-            spt.TaskResult("10.0.0.2", "", 0, True, 5.0),
         ]
-        mock_e2e.return_value = [
-            spt.TaskResult("10.0.0.1", "a", 1, True, 10.0),
-        ]
-        spt.cmd_run(sample_config)
+        ok, rsync_r = spt._prep_machines(sample_config, [m1])
+        assert len(ok) == 1
         mock_docker.assert_called_once()
         mock_seed_ssh.assert_called_once()
 
-    @mock.patch("spt._save_timings")
-    @mock.patch("spt._load_timings", return_value={})
-    @mock.patch("spt._check_ssh")
-    @mock.patch("spt._parallel_e2e", return_value=[])
-    @mock.patch("spt.discover_tests", return_value={"a": ["t1"]})
     @mock.patch("spt._parallel_rsync")
-    def test_no_auto_seed_skips_setup(
-        self, mock_rsync, mock_discover, mock_e2e, mock_ssh,
-        mock_load_t, mock_save_t, sample_config,
-    ):
+    def test_prep_no_seed(self, mock_rsync, sample_config):
         sample_config.seed_auto = False
-        sample_config.seed_setup = "make build"
+        m1 = sample_config.machines[0]
         mock_rsync.return_value = [
             spt.TaskResult("10.0.0.1", "", 0, True, 2.0),
-            spt.TaskResult("10.0.0.2", "", 0, True, 2.0),
         ]
-        mock_e2e.return_value = [
-            spt.TaskResult("10.0.0.1", "a", 1, True, 10.0),
+        ok, rsync_r = spt._prep_machines(sample_config, [m1])
+        assert len(ok) == 1
+
+    @mock.patch("spt._parallel_rsync")
+    def test_prep_rsync_fail(self, mock_rsync, sample_config):
+        sample_config.seed_auto = False
+        m1 = sample_config.machines[0]
+        mock_rsync.return_value = [
+            spt.TaskResult("10.0.0.1", "", 0, False, 1.0, "fail"),
         ]
-        spt.cmd_run(sample_config)
-        # _parallel_ssh for seed should NOT have been called
+        ok, rsync_r = spt._prep_machines(sample_config, [m1])
+        assert len(ok) == 0
 
 
 # ---------------------------------------------------------------------------

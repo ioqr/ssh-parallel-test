@@ -216,58 +216,95 @@ def load_config(path: str) -> Config:
 
 
 # ---------------------------------------------------------------------------
-# Cluster locking
+# Per-machine remote locking
 # ---------------------------------------------------------------------------
 
-LOCK_STALE_SECS = 7200  # 2 hours — assume dead if older than this
+LOCK_STALE_SECS = 7200  # 2 hours - assume dead if older than this
+LOCK_POLL_SECS = 10
 
 import uuid as _uuid
 import socket as _socket
 
 
-def _lock_path(cfg: Config) -> Path:
-    return cfg.timings_file.parent / "lock.json"
+def _lock_dir(cfg: Config) -> str:
+    """Remote lock directory derived from workdir."""
+    slug = re.sub(r'[^a-zA-Z0-9]', '-', cfg.workdir.strip("~/"))
+    return f"/tmp/.spt-lock-{slug}"
 
 
-def _acquire_lock(cfg: Config) -> None:
-    """Acquire an exclusive lock for this cluster. Waits if another run is active."""
-    lock = _lock_path(cfg)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    my_id = str(_uuid.uuid4())[:8]
-
-    while True:
-        if lock.exists():
-            try:
-                info = json.loads(lock.read_text())
-                age = time.time() - info.get("timestamp", 0)
-                owner = info.get("id", "unknown")
-                host = info.get("host", "unknown")
-
-                if age > LOCK_STALE_SECS:
-                    _log(f"Stale lock from {owner}@{host} ({_fmt_duration(age)} ago), taking over")
-                    break
-
-                _log(f"Waiting for run {owner}@{host} ({_fmt_duration(age)} ago)...")
-                time.sleep(5)
-                continue
-            except (json.JSONDecodeError, KeyError):
-                break
-        else:
-            break
-
-    lock.write_text(json.dumps({
-        "id": my_id,
-        "host": _socket.gethostname(),
-        "pid": os.getpid(),
-        "timestamp": time.time(),
-    }))
-    _log(f"Acquired lock {my_id}")
+def _try_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
+    """Try to atomically lock a remote machine. Returns True if acquired."""
+    info = json.dumps({"id": run_id, "host": _socket.gethostname(), "ts": time.time()})
+    r = subprocess.run(
+        ["ssh", *_SSH_OPTS, dest,
+         f"mkdir {lock_dir} 2>/dev/null && echo '{info}' > {lock_dir}/info && echo LOCKED"
+         f" || echo BUSY"],
+        capture_output=True, text=True, timeout=15,
+    )
+    return "LOCKED" in r.stdout
 
 
-def _release_lock(cfg: Config) -> None:
-    lock = _lock_path(cfg)
-    if lock.exists():
-        lock.unlink()
+def _check_lock_stale(dest: str, lock_dir: str) -> bool:
+    """Check if an existing lock is stale. Returns True if stale."""
+    r = subprocess.run(
+        ["ssh", *_SSH_OPTS, dest, f"cat {lock_dir}/info 2>/dev/null"],
+        capture_output=True, text=True, timeout=15,
+    )
+    try:
+        info = json.loads(r.stdout)
+        age = time.time() - info.get("ts", 0)
+        return age > LOCK_STALE_SECS
+    except (json.JSONDecodeError, ValueError):
+        return True  # corrupt lock, treat as stale
+
+
+def _force_lock_machine(dest: str, lock_dir: str, run_id: str) -> bool:
+    """Force-acquire a lock (for stale lock takeover)."""
+    info = json.dumps({"id": run_id, "host": _socket.gethostname(), "ts": time.time()})
+    r = subprocess.run(
+        ["ssh", *_SSH_OPTS, dest,
+         f"rm -rf {lock_dir} && mkdir {lock_dir} && echo '{info}' > {lock_dir}/info && echo LOCKED"],
+        capture_output=True, text=True, timeout=15,
+    )
+    return "LOCKED" in r.stdout
+
+
+def _unlock_machine(dest: str, lock_dir: str) -> None:
+    """Release the lock on a remote machine."""
+    subprocess.run(
+        ["ssh", *_SSH_OPTS, dest, f"rm -rf {lock_dir}"],
+        capture_output=True, timeout=15,
+    )
+
+
+def _try_lock_machines(
+    machines: list[Machine], lock_dir: str, run_id: str,
+) -> list[Machine]:
+    """Try to lock multiple machines in parallel. Returns those acquired."""
+    locked = []
+
+    def _try(m: Machine) -> Machine | None:
+        if _try_lock_machine(m.ssh_dest, lock_dir, run_id):
+            return m
+        # Check for stale lock
+        if _check_lock_stale(m.ssh_dest, lock_dir):
+            _log(f"Stale lock on {m.host}, taking over")
+            if _force_lock_machine(m.ssh_dest, lock_dir, run_id):
+                return m
+        return None
+
+    with ThreadPoolExecutor(max_workers=max(1, len(machines))) as pool:
+        for result in pool.map(_try, machines):
+            if result is not None:
+                locked.append(result)
+
+    return locked
+
+
+def _unlock_machines(machines: list[Machine], lock_dir: str) -> None:
+    """Release locks on multiple machines in parallel."""
+    with ThreadPoolExecutor(max_workers=max(1, len(machines))) as pool:
+        pool.map(lambda m: _unlock_machine(m.ssh_dest, lock_dir), machines)
 
 
 # ---------------------------------------------------------------------------
@@ -909,42 +946,45 @@ def cmd_seed(cfg: Config) -> None:
     _log(f"Seed complete in {_fmt_duration(total)}.")
 
 
+def _prep_machines(cfg: Config, machines: list[Machine]) -> list[Machine]:
+    """rsync + auto-seed a set of machines. Returns those that succeeded."""
+    # rsync
+    orig_machines = cfg.machines
+    cfg.machines = machines
+    rsync_results = _parallel_rsync(cfg)
+    cfg.machines = orig_machines
+    ok = [m for m in machines if any(
+        r.host == m.host and r.ok for r in rsync_results
+    )]
+    if not ok:
+        return [], rsync_results
+
+    # auto-seed
+    if cfg.seed_auto:
+        _ensure_docker(cfg)
+    if cfg.seed_auto and cfg.seed_setup:
+        _log(f"Auto-seeding {len(ok)} machine(s)...")
+        setup_results = _parallel_ssh(ok, cfg.seed_setup, cfg.workdir, "seed", timeout=1800)
+        failed = [sr for sr in setup_results if not sr.ok]
+        for sr in failed:
+            print(f"\n--- seed output ({sr.host}) ---\n{sr.output}---\n", file=sys.stderr)
+            _log(f"{_YELLOW}warning:{_RESET} seed failed on {sr.host}, skipping")
+        failed_hosts = {sr.host for sr in failed}
+        ok = [m for m in ok if m.host not in failed_hosts]
+        if ok:
+            _log("Auto-seed complete.")
+
+    return ok, rsync_results
+
+
 def cmd_run(cfg: Config) -> RunResult:
-    _acquire_lock(cfg)
-    try:
-        return _cmd_run_inner(cfg)
-    finally:
-        _release_lock(cfg)
-
-
-def _cmd_run_inner(cfg: Config) -> RunResult:
     t0 = time.monotonic()
+    run_id = str(_uuid.uuid4())[:8]
+    lock_dir = _lock_dir(cfg)
 
     _check_ssh(cfg)
 
-    # Phase 1: rsync
-    rsync_results = _parallel_rsync(cfg)
-    rsync_ok_hosts = {r.host for r in rsync_results if r.ok}
-
-    # Auto-seed: install Docker if needed, then run setup (e.g. build images)
-    if cfg.seed_auto:
-        _ensure_docker(cfg)
-
-    if cfg.seed_auto and cfg.seed_setup:
-        ok_machines = [m for m in cfg.machines if m.host in rsync_ok_hosts]
-        if ok_machines:
-            _log("Auto-seeding machines...")
-            setup_results = _parallel_ssh(
-                ok_machines, cfg.seed_setup,
-                cfg.workdir, "seed", timeout=1800,
-            )
-            for sr in setup_results:
-                if not sr.ok:
-                    print(f"\n--- seed output ({sr.host}) ---\n{sr.output}---\n", file=sys.stderr)
-                    _die(f"Auto-seed failed on {sr.host}")
-            _log("Auto-seed complete.")
-
-    # Phase 2: discover + schedule
+    # Discover tests upfront
     _log("Discovering tests...")
     tests_by_group = discover_tests(cfg)
     total_tests = sum(len(t) for t in tests_by_group.values())
@@ -954,35 +994,99 @@ def _cmd_run_inner(cfg: Config) -> RunResult:
     if timings:
         _log(f"Loaded timings for {len(timings)} tests (LPT scheduling)")
 
-    available = [m for m in cfg.machines if m.host in rsync_ok_hosts]
-    assignments = schedule(available, tests_by_group, timings)
+    # Remaining tests to schedule (mutable copy)
+    remaining = {g: list(tests) for g, tests in tests_by_group.items()}
 
-    _log(f"Scheduled {len(assignments)} tasks across {len(available)} machines:")
-    for a in assignments:
-        _log(f"  {a.machine.host} / {a.group}: {len(a.test_ids)} tests")
+    all_machines = list(cfg.machines)
+    locked_hosts: set[str] = set()
+    all_rsync_results: list[TaskResult] = []
+    all_e2e_results: list[TaskResult] = []
+    executor = ThreadPoolExecutor(max_workers=max(1, len(all_machines)))
+    running: dict = {}  # future -> TestAssignment
 
-    # Phase 3: execute
-    e2e_results = _parallel_e2e(cfg, assignments, timings) if assignments else []
+    try:
+        while any(remaining.values()) or running:
+            # Try to lock free machines
+            unlocked = [m for m in all_machines if m.host not in locked_hosts]
+            if unlocked and any(remaining.values()):
+                newly_locked = _try_lock_machines(unlocked, lock_dir, run_id)
+                if newly_locked:
+                    hosts = ", ".join(m.host for m in newly_locked)
+                    _log(f"Locked {len(newly_locked)} machine(s): {hosts}")
+                    locked_hosts.update(m.host for m in newly_locked)
 
-    # Collect per-test timings from output (all results, not just passing)
-    for r in e2e_results:
+                    # Prep (rsync + seed)
+                    prepped, rsync_r = _prep_machines(cfg, newly_locked)
+                    all_rsync_results.extend(rsync_r)
+
+                    if prepped:
+                        # Schedule remaining tests onto new machines
+                        assignments = schedule(prepped, remaining, timings)
+                        if assignments:
+                            _log(f"Scheduled {len(assignments)} tasks:")
+                            for a in assignments:
+                                _log(f"  {a.machine.host} / {a.group}: {len(a.test_ids)} tests")
+                                # Remove assigned tests from remaining
+                                for t in a.test_ids:
+                                    if t in remaining.get(a.group, []):
+                                        remaining[a.group].remove(t)
+                                # Launch
+                                fut = executor.submit(_run_assignment, cfg, a)
+                                running[fut] = a
+
+                    # Clean up empty groups
+                    remaining = {g: t for g, t in remaining.items() if t}
+
+            # Check for completed assignments
+            done = [f for f in running if f.done()]
+            for f in done:
+                a = running.pop(f)
+                result = f.result()
+                all_e2e_results.append(result)
+
+                # Unlock machine if no more running assignments on it
+                host_still_running = any(
+                    running[ff].machine.host == a.machine.host for ff in running
+                )
+                if not host_still_running:
+                    _unlock_machine(a.machine.ssh_dest, lock_dir)
+                    locked_hosts.discard(a.machine.host)
+
+                tag = f"{_GREEN}PASS{_RESET}" if result.ok else f"{_RED}FAIL{_RESET}"
+                _log(f"e2e    {result.group} ({result.test_count} tests) @ {result.host} {tag} ({_fmt_duration(result.duration)})")
+
+            # If we have pending tests but no machines available, wait
+            if any(remaining.values()) and not done:
+                if not running:
+                    _log(f"All machines busy, waiting {LOCK_POLL_SECS}s...")
+                time.sleep(LOCK_POLL_SECS)
+
+    finally:
+        # Always unlock everything we hold
+        to_unlock = [m for m in all_machines if m.host in locked_hosts]
+        if to_unlock:
+            _unlock_machines(to_unlock, lock_dir)
+        executor.shutdown(wait=False)
+
+    # Collect timings from output
+    for r in all_e2e_results:
         parsed = _parse_durations(r.output, cfg.duration_regex)
         timings.update(parsed)
     _save_timings(cfg, timings)
 
     total_dur = time.monotonic() - t0
-    passed = sum(r.test_count for r in e2e_results if r.ok)
+    passed = sum(r.test_count for r in all_e2e_results if r.ok)
 
     result = RunResult(
-        rsync_results=rsync_results,
-        e2e_results=e2e_results,
+        rsync_results=all_rsync_results,
+        e2e_results=all_e2e_results,
         total_duration=total_dur,
         total_tests=total_tests,
         passed_tests=passed,
     )
 
     # Print full output for failed tasks
-    for r in e2e_results:
+    for r in all_e2e_results:
         if not r.ok and r.output:
             print(f"\n{'=' * 60}", file=sys.stderr)
             print(f"  FAILED: {r.group} @ {r.host}", file=sys.stderr)
